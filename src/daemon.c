@@ -2,6 +2,7 @@
 #include "apple_als_keepalive.h"
 #include "sabg/ambient_model.h"
 #include "sabg/smoother.h"
+#include "sabg/write_tracker.h"
 
 #include <errno.h>
 #include <getopt.h>
@@ -16,7 +17,7 @@
 #include <systemd/sd-event.h>
 #include <time.h>
 
-#define VERSION "0.1.0"
+#define VERSION "0.2.0"
 
 #define SENSOR_DESTINATION "net.hadess.SensorProxy"
 #define SENSOR_PATH "/net/hadess/SensorProxy"
@@ -29,6 +30,7 @@
 typedef struct {
     unsigned int brighten_step_ms;
     unsigned int dim_step_ms;
+    unsigned int maximum_transition_ms;
     unsigned int apple_refresh_ms;
     double ambient_time_constant_seconds;
     int minimum_percentage;
@@ -50,12 +52,11 @@ typedef struct {
     sd_bus_slot *brightness_properties_slot;
     SabgAmbientModel ambient;
     SabgSmoother smoother;
+    SabgWriteTracker write_tracker;
     SabgAppleAlsKeepalive keepalive;
     double current_lux;
-    int last_written_percentage;
     bool light_claimed;
     bool model_ready;
-    bool write_pending;
 } Application;
 
 static uint64_t monotonic_usec(void)
@@ -105,6 +106,7 @@ static void print_usage(FILE *stream, const char *program)
         "\n"
         "  --brighten-step-ms N       delay per 1%% increase (default: 40)\n"
         "  --dim-step-ms N            delay per 1%% decrease (default: 60)\n"
+        "  --max-transition-ms N      maximum automatic fade time (default: 250)\n"
         "  --ambient-time-constant S  target filter time constant (default: 1.6)\n"
         "  --min-brightness N         automatic floor (default: 2)\n"
         "  --max-brightness N         automatic ceiling (default: 100)\n"
@@ -125,6 +127,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
     enum {
         OPTION_BRIGHTEN_STEP = 1000,
         OPTION_DIM_STEP,
+        OPTION_MAX_TRANSITION,
         OPTION_AMBIENT_TIME_CONSTANT,
         OPTION_MIN_BRIGHTNESS,
         OPTION_MAX_BRIGHTNESS,
@@ -139,6 +142,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
     static const struct option options[] = {
         {"brighten-step-ms", required_argument, NULL, OPTION_BRIGHTEN_STEP},
         {"dim-step-ms", required_argument, NULL, OPTION_DIM_STEP},
+        {"max-transition-ms", required_argument, NULL, OPTION_MAX_TRANSITION},
         {"ambient-time-constant", required_argument, NULL, OPTION_AMBIENT_TIME_CONSTANT},
         {"min-brightness", required_argument, NULL, OPTION_MIN_BRIGHTNESS},
         {"max-brightness", required_argument, NULL, OPTION_MAX_BRIGHTNESS},
@@ -158,6 +162,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
     *configuration = (Configuration){
         .brighten_step_ms = 40,
         .dim_step_ms = 60,
+        .maximum_transition_ms = 250,
         .apple_refresh_ms = 500,
         .ambient_time_constant_seconds = 1.6,
         .minimum_percentage = 2,
@@ -175,6 +180,11 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
             if (parse_int(optarg, 1, 5000, &parsed) < 0)
                 return -EINVAL;
             configuration->dim_step_ms = (unsigned int)parsed;
+            break;
+        case OPTION_MAX_TRANSITION:
+            if (parse_int(optarg, 1, 10000, &parsed) < 0)
+                return -EINVAL;
+            configuration->maximum_transition_ms = (unsigned int)parsed;
             break;
         case OPTION_AMBIENT_TIME_CONSTANT:
             if (parse_double(optarg, 0.01, 300.0, &configuration->ambient_time_constant_seconds) < 0)
@@ -331,36 +341,34 @@ static int read_changed_int(
     return result < 0 ? result : found;
 }
 
-static int schedule_animation(Application *application, uint64_t delay_usec);
+static int schedule_animation(Application *application, uint64_t wakeup_usec);
 
-static int ensure_animation_scheduled(Application *application)
+static int on_brightness_write_reply(
+    sd_bus_message *message,
+    void *userdata,
+    sd_bus_error *ret_error
+)
 {
-    int enabled;
+    Application *application = userdata;
+    const sd_bus_error *error;
 
-    if (!sabg_smoother_active(&application->smoother))
+    (void)ret_error;
+    if (!sd_bus_message_is_method_error(message, NULL))
         return 0;
-    if (application->animation_timer == NULL)
-        return schedule_animation(
-            application,
-            sabg_smoother_next_delay_usec(&application->smoother)
-        );
 
-    {
-        int result = sd_event_source_get_enabled(application->animation_timer, &enabled);
-        if (result < 0)
-            return result;
-    }
-    if (enabled != SD_EVENT_OFF)
-        return 0;
-    return schedule_animation(
-        application,
-        sabg_smoother_next_delay_usec(&application->smoother)
+    error = sd_bus_message_get_error(message);
+    sabg_write_tracker_clear(&application->write_tracker);
+    fprintf(
+        stderr,
+        "Unable to set GNOME brightness: %s\n",
+        error != NULL && error->message != NULL ? error->message : "unknown D-Bus error"
     );
+    return 0;
 }
 
 static int write_brightness(Application *application, int percentage)
 {
-    sd_bus_error error = SD_BUS_ERROR_NULL;
+    sd_bus_message *message = NULL;
     int result;
 
     if (application->configuration.dry_run) {
@@ -369,24 +377,42 @@ static int write_brightness(Application *application, int percentage)
         return 0;
     }
 
-    application->last_written_percentage = percentage;
-    application->write_pending = true;
-    result = sd_bus_set_property(
+    result = sd_bus_message_new_method_call(
         application->session_bus,
+        &message,
         GNOME_POWER_DESTINATION,
         GNOME_POWER_PATH,
-        GNOME_SCREEN_INTERFACE,
-        "Brightness",
-        &error,
-        "i",
-        (int32_t)percentage
+        "org.freedesktop.DBus.Properties",
+        "Set"
     );
-    if (result < 0) {
-        application->write_pending = false;
-        fprintf(stderr, "Unable to set GNOME brightness: %s\n",
-            error.message != NULL ? error.message : strerror(-result));
+    if (result >= 0)
+        result = sd_bus_message_append(message, "ss", GNOME_SCREEN_INTERFACE, "Brightness");
+    if (result >= 0)
+        result = sd_bus_message_open_container(message, SD_BUS_TYPE_VARIANT, "i");
+    if (result >= 0)
+        result = sd_bus_message_append(message, "i", (int32_t)percentage);
+    if (result >= 0)
+        result = sd_bus_message_close_container(message);
+    if (result >= 0) {
+        result = sd_bus_call_async(
+            application->session_bus,
+            NULL,
+            message,
+            on_brightness_write_reply,
+            application,
+            0
+        );
+        if (result >= 0) {
+            sabg_write_tracker_record(
+                &application->write_tracker,
+                percentage,
+                monotonic_usec()
+            );
+        }
     }
-    sd_bus_error_free(&error);
+    message = sd_bus_message_unref(message);
+    if (result < 0)
+        fprintf(stderr, "Unable to queue GNOME brightness: %s\n", strerror(-result));
     return result;
 }
 
@@ -398,7 +424,7 @@ static int on_animation_timer(sd_event_source *source, uint64_t usec, void *user
 
     (void)source;
     (void)usec;
-    percentage = sabg_smoother_advance(&application->smoother);
+    percentage = sabg_smoother_advance(&application->smoother, monotonic_usec());
     result = write_brightness(application, percentage);
     if (result < 0)
         return result;
@@ -406,7 +432,7 @@ static int on_animation_timer(sd_event_source *source, uint64_t usec, void *user
     if (sabg_smoother_active(&application->smoother))
         return schedule_animation(
             application,
-            sabg_smoother_next_delay_usec(&application->smoother)
+            sabg_smoother_next_wakeup_usec(&application->smoother)
         );
 
     if (application->configuration.verbose)
@@ -414,28 +440,23 @@ static int on_animation_timer(sd_event_source *source, uint64_t usec, void *user
     return 0;
 }
 
-static int schedule_animation(Application *application, uint64_t delay_usec)
+static int schedule_animation(Application *application, uint64_t wakeup_usec)
 {
-    uint64_t now;
     int result;
-
-    result = sd_event_now(application->event, CLOCK_MONOTONIC, &now);
-    if (result < 0)
-        return result;
 
     if (application->animation_timer == NULL) {
         return sd_event_add_time(
             application->event,
             &application->animation_timer,
             CLOCK_MONOTONIC,
-            now + delay_usec,
-            0,
+            wakeup_usec,
+            UINT64_C(1000),
             on_animation_timer,
             application
         );
     }
 
-    result = sd_event_source_set_time(application->animation_timer, now + delay_usec);
+    result = sd_event_source_set_time(application->animation_timer, wakeup_usec);
     if (result < 0)
         return result;
     return sd_event_source_set_enabled(application->animation_timer, SD_EVENT_ONESHOT);
@@ -463,10 +484,29 @@ static int on_sensor_properties(sd_bus_message *message, void *userdata, sd_bus_
     if (application->configuration.verbose)
         fprintf(stderr, "ambient %.2f lux -> target %d%%\n", lux, target);
 
-    if (sabg_smoother_set_target(&application->smoother, target)) {
-        result = ensure_animation_scheduled(application);
-        if (result < 0)
-            return result;
+    if (sabg_smoother_set_target(&application->smoother, target, monotonic_usec())) {
+        if (sabg_smoother_active(&application->smoother)) {
+            if (application->configuration.verbose) {
+                fprintf(
+                    stderr,
+                    "transition %d%% -> %d%% in %llu ms across %u frames\n",
+                    application->smoother.start,
+                    application->smoother.target,
+                    (unsigned long long)(application->smoother.duration_usec / UINT64_C(1000)),
+                    application->smoother.frame_count
+                );
+            }
+            result = schedule_animation(
+                application,
+                sabg_smoother_next_wakeup_usec(&application->smoother)
+            );
+            if (result < 0)
+                return result;
+        } else if (application->animation_timer != NULL) {
+            result = sd_event_source_set_enabled(application->animation_timer, SD_EVENT_OFF);
+            if (result < 0)
+                return result;
+        }
     }
     return 0;
 }
@@ -482,17 +522,19 @@ static int on_brightness_properties(sd_bus_message *message, void *userdata, sd_
     if (result <= 0)
         return result;
 
-    if (application->write_pending && percentage == application->last_written_percentage) {
-        application->write_pending = false;
+    if (sabg_write_tracker_consume(
+        &application->write_tracker,
+        percentage,
+        monotonic_usec()
+    )) {
         return 0;
     }
 
     if (!application->model_ready)
         return 0;
 
-    application->write_pending = false;
-    application->smoother.current = percentage;
-    application->smoother.target = percentage;
+    sabg_write_tracker_clear(&application->write_tracker);
+    sabg_smoother_reset(&application->smoother, percentage);
     if (application->animation_timer != NULL)
         sd_event_source_set_enabled(application->animation_timer, SD_EVENT_OFF);
     sabg_ambient_model_recalibrate(
@@ -670,7 +712,8 @@ static int application_start(Application *application)
         &application->smoother,
         brightness,
         application->configuration.brighten_step_ms,
-        application->configuration.dim_step_ms
+        application->configuration.dim_step_ms,
+        application->configuration.maximum_transition_ms
     );
     sabg_ambient_model_init(
         &application->ambient,
