@@ -34,7 +34,8 @@ GNOME Shell extension, direct sysfs write permission, or root daemon is required
 Ubuntu/Debian build dependencies:
 
 ```bash
-sudo apt install build-essential cmake ninja-build pkg-config libsystemd-dev
+sudo apt install \
+  build-essential cmake gir1.2-gtk-4.0 libsystemd-dev ninja-build pkg-config python3-gi
 ```
 
 Configure, build, and test:
@@ -134,6 +135,7 @@ systemctl --user restart smooth-autobrightness-for-gnome.service
 - Manual changes: immediate, cancel only that device's transition, and recalibrate
 - Manual keyboard off: suspend keyboard automation until manually raised above zero
 - Automatic keyboard zero: remain active and brighten again when the room darkens
+- Display power-down: turn keyboard illumination off, then resume its ambient target on wake
 
 Short trajectory corrections retain the natural 40 ms-per-point timing.
 Larger corrections are compressed to 250 ms. Retargeting preserves velocity,

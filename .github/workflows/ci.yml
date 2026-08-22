@@ -8,12 +8,19 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config libsystemd-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gir1.2-gtk-4.0 \
+            libsystemd-dev \
+            ninja-build \
+            pkg-config \
+            python3-gi
       - name: Configure
         run: cmake --preset dev
       - name: Build
         run: cmake --build --preset dev
       - name: Test
-        run: ctest --preset dev
+        run: ctest --preset dev --output-on-failure
