@@ -123,6 +123,7 @@ systemctl --user restart smooth-autobrightness-for-gnome.service
 - Dimming: one percentage point every 60 ms
 - Maximum transition duration: 250 ms
 - Maximum active update rate: 60 Hz
+- Target hysteresis: 2 percentage points, with reachable 0%/100% endpoints
 - Automatic range: 2–100 percent
 - Display response: brighter environment means a brighter display
 - Keyboard response: darker environment means brighter key illumination
@@ -136,9 +137,10 @@ transitions are compressed to 250 ms and use no more than 60 updates per
 second, avoiding high-rate D-Bus traffic while keeping large changes
 responsive.
 
-The transition cap, natural step rates, ambient filter, and automatic range are
-configurable from the command line; see `--help`. The 60 Hz update ceiling is
-an internal safety limit.
+The transition cap, natural step rates, ambient filter, hysteresis, and
+automatic range are configurable from the command line; see `--help`. Set
+`--hysteresis 0` to disable target hysteresis. The 60 Hz update ceiling is an
+internal safety limit.
 
 Keyboard control is enabled when a supported interface is present. Disable it
 without affecting display automation with `--no-keyboard-backlight`. Systems

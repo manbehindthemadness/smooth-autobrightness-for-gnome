@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 
 project(
   smooth-autobrightness-for-gnome
-  VERSION 0.3.0
+  VERSION 0.3.1
   DESCRIPTION "Low-overhead smooth ambient-light brightness for GNOME"
   LANGUAGES C
 )
@@ -17,6 +17,7 @@ add_library(sabg_core STATIC
   src/ambient_model.c
   src/keyboard_model.c
   src/smoother.c
+  src/target_hysteresis.c
   src/write_tracker.c
 )
 target_include_directories(sabg_core PUBLIC include)
@@ -64,4 +65,8 @@ if(BUILD_TESTING)
   add_executable(test-keyboard-model tests/test_keyboard_model.c)
   target_link_libraries(test-keyboard-model PRIVATE sabg_core)
   add_test(NAME keyboard-model COMMAND test-keyboard-model)
+
+  add_executable(test-target-hysteresis tests/test_target_hysteresis.c)
+  target_link_libraries(test-target-hysteresis PRIVATE sabg_core)
+  add_test(NAME target-hysteresis COMMAND test-target-hysteresis)
 endif()

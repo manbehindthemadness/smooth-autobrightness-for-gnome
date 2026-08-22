@@ -3,6 +3,7 @@
 #include "sabg/ambient_model.h"
 #include "sabg/keyboard_model.h"
 #include "sabg/smoother.h"
+#include "sabg/target_hysteresis.h"
 #include "sabg/write_tracker.h"
 
 #include <errno.h>
@@ -19,7 +20,7 @@
 #include <systemd/sd-event.h>
 #include <time.h>
 
-#define VERSION "0.3.0"
+#define VERSION "0.3.1"
 
 #define SENSOR_DESTINATION "net.hadess.SensorProxy"
 #define SENSOR_PATH "/net/hadess/SensorProxy"
@@ -46,6 +47,7 @@ typedef struct {
     unsigned int brighten_step_ms;
     unsigned int dim_step_ms;
     unsigned int maximum_transition_ms;
+    unsigned int hysteresis_percentage;
     unsigned int apple_refresh_ms;
     double ambient_time_constant_seconds;
     int minimum_percentage;
@@ -70,9 +72,11 @@ typedef struct {
     sd_bus_slot *keyboard_brightness_slot;
     SabgAmbientModel ambient;
     SabgSmoother smoother;
+    SabgTargetHysteresis target_hysteresis;
     SabgWriteTracker write_tracker;
     SabgKeyboardModel keyboard_model;
     SabgSmoother keyboard_smoother;
+    SabgTargetHysteresis keyboard_target_hysteresis;
     SabgWriteTracker keyboard_write_tracker;
     SabgAppleAlsKeepalive keepalive;
     double current_lux;
@@ -132,6 +136,7 @@ static void print_usage(FILE *stream, const char *program)
         "  --brighten-step-ms N       delay per 1%% increase (default: 40)\n"
         "  --dim-step-ms N            delay per 1%% decrease (default: 60)\n"
         "  --max-transition-ms N      maximum automatic fade time (default: 250)\n"
+        "  --hysteresis N             target change threshold in %% (default: 2)\n"
         "  --ambient-time-constant S  target filter time constant (default: 1.6)\n"
         "  --min-brightness N         automatic floor (default: 2)\n"
         "  --max-brightness N         automatic ceiling (default: 100)\n"
@@ -154,6 +159,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
         OPTION_BRIGHTEN_STEP = 1000,
         OPTION_DIM_STEP,
         OPTION_MAX_TRANSITION,
+        OPTION_HYSTERESIS,
         OPTION_AMBIENT_TIME_CONSTANT,
         OPTION_MIN_BRIGHTNESS,
         OPTION_MAX_BRIGHTNESS,
@@ -170,6 +176,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
         {"brighten-step-ms", required_argument, NULL, OPTION_BRIGHTEN_STEP},
         {"dim-step-ms", required_argument, NULL, OPTION_DIM_STEP},
         {"max-transition-ms", required_argument, NULL, OPTION_MAX_TRANSITION},
+        {"hysteresis", required_argument, NULL, OPTION_HYSTERESIS},
         {"ambient-time-constant", required_argument, NULL, OPTION_AMBIENT_TIME_CONSTANT},
         {"min-brightness", required_argument, NULL, OPTION_MIN_BRIGHTNESS},
         {"max-brightness", required_argument, NULL, OPTION_MAX_BRIGHTNESS},
@@ -191,6 +198,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
         .brighten_step_ms = 40,
         .dim_step_ms = 60,
         .maximum_transition_ms = 250,
+        .hysteresis_percentage = 2,
         .apple_refresh_ms = 500,
         .ambient_time_constant_seconds = 1.6,
         .minimum_percentage = 2,
@@ -214,6 +222,11 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
             if (parse_int(optarg, 1, 10000, &parsed) < 0)
                 return -EINVAL;
             configuration->maximum_transition_ms = (unsigned int)parsed;
+            break;
+        case OPTION_HYSTERESIS:
+            if (parse_int(optarg, 0, 100, &parsed) < 0)
+                return -EINVAL;
+            configuration->hysteresis_percentage = (unsigned int)parsed;
             break;
         case OPTION_AMBIENT_TIME_CONSTANT:
             if (parse_double(optarg, 0.01, 300.0, &configuration->ambient_time_constant_seconds) < 0)
@@ -815,6 +828,12 @@ static int update_keyboard_target(Application *application, double lux, uint64_t
 
     if (application->configuration.verbose)
         fprintf(stderr, "ambient %.2f lux -> keyboard target %d%%\n", lux, target);
+    if (!sabg_target_hysteresis_accept(
+        &application->keyboard_target_hysteresis,
+        target
+    )) {
+        return 0;
+    }
     if (!sabg_smoother_set_target(&application->keyboard_smoother, target, now_usec))
         return 0;
     if (!sabg_smoother_active(&application->keyboard_smoother)) {
@@ -868,6 +887,10 @@ static int on_keyboard_brightness(sd_bus_message *message, void *userdata, sd_bu
 
     sabg_write_tracker_clear(&application->keyboard_write_tracker);
     sabg_smoother_reset(&application->keyboard_smoother, percentage);
+    sabg_target_hysteresis_reset(
+        &application->keyboard_target_hysteresis,
+        percentage
+    );
     if (application->keyboard_animation_timer != NULL)
         sd_event_source_set_enabled(application->keyboard_animation_timer, SD_EVENT_OFF);
     sabg_keyboard_model_manual_change(
@@ -915,7 +938,8 @@ static int on_sensor_properties(sd_bus_message *message, void *userdata, sd_bus_
     if (application->configuration.verbose)
         fprintf(stderr, "ambient %.2f lux -> target %d%%\n", lux, target);
 
-    if (sabg_smoother_set_target(&application->smoother, target, now_usec)) {
+    if (sabg_target_hysteresis_accept(&application->target_hysteresis, target)
+        && sabg_smoother_set_target(&application->smoother, target, now_usec)) {
         if (sabg_smoother_active(&application->smoother)) {
             if (application->configuration.verbose) {
                 fprintf(
@@ -966,6 +990,7 @@ static int on_brightness_properties(sd_bus_message *message, void *userdata, sd_
 
     sabg_write_tracker_clear(&application->write_tracker);
     sabg_smoother_reset(&application->smoother, percentage);
+    sabg_target_hysteresis_reset(&application->target_hysteresis, percentage);
     if (application->animation_timer != NULL)
         sd_event_source_set_enabled(application->animation_timer, SD_EVENT_OFF);
     sabg_ambient_model_recalibrate(
@@ -1163,6 +1188,13 @@ static int application_start(Application *application)
         application->configuration.dim_step_ms,
         application->configuration.maximum_transition_ms
     );
+    sabg_target_hysteresis_init(
+        &application->target_hysteresis,
+        brightness,
+        application->configuration.minimum_percentage,
+        application->configuration.maximum_percentage,
+        application->configuration.hysteresis_percentage
+    );
     sabg_ambient_model_init(
         &application->ambient,
         lux,
@@ -1181,6 +1213,13 @@ static int application_start(Application *application)
             application->configuration.brighten_step_ms,
             application->configuration.dim_step_ms,
             application->configuration.maximum_transition_ms
+        );
+        sabg_target_hysteresis_init(
+            &application->keyboard_target_hysteresis,
+            keyboard_brightness,
+            0,
+            100,
+            application->configuration.hysteresis_percentage
         );
         sabg_keyboard_model_init(
             &application->keyboard_model,
