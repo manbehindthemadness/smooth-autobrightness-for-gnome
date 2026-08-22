@@ -125,7 +125,7 @@ systemctl --user restart smooth-autobrightness-for-gnome.service
 - Gradual brightening and dimming: one percentage point every 40 ms
 - Changes of 12 percentage points or more: accelerated catch-up response
 - Maximum transition duration: 250 ms
-- Maximum active update rate: 60 Hz
+- Adaptive active update rate: 2–60 Hz based on envelope velocity and deadline
 - Target hysteresis: 2 percentage points, with reachable 0%/100% endpoints
 - Automatic range: 2–100 percent
 - Display response: brighter environment means a brighter display
@@ -137,13 +137,14 @@ systemctl --user restart smooth-autobrightness-for-gnome.service
 
 Short trajectory corrections retain the natural 40 ms-per-point timing.
 Larger corrections are compressed to 250 ms. Retargeting preserves velocity,
-and output is quantized to actual integer brightness changes at no more than
-60 updates per second, avoiding high-rate D-Bus traffic while keeping large
-changes responsive.
+and output is quantized to actual integer brightness changes. The scheduler
+runs near-stationary, multi-minute drift at 2 Hz, scales through intermediate
+rates for gradual motion, and reaches 60 Hz only for rapid changes or deadline
+pressure.
 
 The transition cap, natural step rates, ambient filter, hysteresis, and
 automatic range are configurable from the command line; see `--help`. Set
-`--hysteresis 0` to disable output hysteresis. The 60 Hz update ceiling is an
+`--hysteresis 0` to disable output hysteresis. The 2–60 Hz adaptive range is an
 internal safety limit. `--legacy-transitions` temporarily retains the pre-0.4
 restarted-fade controller for compatibility testing.
 

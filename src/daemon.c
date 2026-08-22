@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "apple_als_keepalive.h"
 #include "sabg/ambient_model.h"
+#include "sabg/frame_scheduler.h"
 #include "sabg/keyboard_model.h"
 #include "sabg/output_quantizer.h"
 #include "sabg/smoother.h"
@@ -36,7 +37,9 @@
 #define UPOWER_INTERFACE "org.freedesktop.UPower"
 #define UPOWER_KEYBOARD_PATH "/org/freedesktop/UPower/KbdBacklight"
 #define UPOWER_KEYBOARD_INTERFACE "org.freedesktop.UPower.KbdBacklight"
-#define MOTION_UPDATE_HZ UINT64_C(60)
+#define MOTION_MINIMUM_UPDATE_HZ 2U
+#define MOTION_MAXIMUM_UPDATE_HZ 60U
+#define MOTION_MAXIMUM_STEP_PER_FRAME 0.2
 /* Dimming needs a shorter envelope because sparse low-end panel steps expose its tail. */
 #define TRAJECTORY_DIMMING_TIME_CONSTANT_FACTOR (1.0 / 3.0)
 #define TRAJECTORY_DIMMING_FINISH_DISTANCE 4.0
@@ -952,6 +955,51 @@ static bool motion_active(const Application *application)
 
 static int schedule_motion_update(Application *application, uint64_t now_usec);
 
+static unsigned int trajectory_update_rate(
+    const SabgTrajectory *trajectory,
+    double model_velocity,
+    uint64_t now_usec
+)
+{
+    uint64_t remaining_usec = trajectory->deadline_usec > now_usec
+        ? trajectory->deadline_usec - now_usec
+        : 0;
+
+    return sabg_frame_scheduler_rate(
+        fabs(model_velocity) > fabs(trajectory->velocity)
+            ? model_velocity
+            : trajectory->velocity,
+        trajectory->target - trajectory->position,
+        remaining_usec,
+        MOTION_MINIMUM_UPDATE_HZ,
+        MOTION_MAXIMUM_UPDATE_HZ,
+        MOTION_MAXIMUM_STEP_PER_FRAME
+    );
+}
+
+static unsigned int motion_update_rate(
+    const Application *application,
+    uint64_t now_usec
+)
+{
+    unsigned int rate = trajectory_update_rate(
+        &application->display_trajectory,
+        sabg_ambient_model_velocity(&application->ambient),
+        now_usec
+    );
+
+    if (application->keyboard_model_ready) {
+        unsigned int keyboard_rate = trajectory_update_rate(
+            &application->keyboard_trajectory,
+            sabg_keyboard_model_velocity(&application->keyboard_model),
+            now_usec
+        );
+        if (keyboard_rate > rate)
+            rate = keyboard_rate;
+    }
+    return rate;
+}
+
 static int update_motion(
     Application *application,
     double lux,
@@ -1039,7 +1087,8 @@ static int on_motion_timer(sd_event_source *source, uint64_t usec, void *userdat
 
 static int schedule_motion_update(Application *application, uint64_t now_usec)
 {
-    uint64_t wakeup_usec = now_usec + UINT64_C(1000000) / MOTION_UPDATE_HZ;
+    unsigned int update_hz = motion_update_rate(application, now_usec);
+    uint64_t wakeup_usec = now_usec + UINT64_C(1000000) / update_hz;
     int result;
 
     if (application->motion_timer == NULL) {

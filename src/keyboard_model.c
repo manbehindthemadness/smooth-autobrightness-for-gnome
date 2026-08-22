@@ -82,6 +82,12 @@ bool sabg_keyboard_model_active(const SabgKeyboardModel *model)
         && sabg_ambient_model_active(&model->inverse_ambient);
 }
 
+double sabg_keyboard_model_velocity(const SabgKeyboardModel *model)
+{
+    assert(model != NULL);
+    return -sabg_ambient_model_velocity(&model->inverse_ambient);
+}
+
 void sabg_keyboard_model_set_activity_threshold(
     SabgKeyboardModel *model,
     double percentage

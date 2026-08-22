@@ -34,6 +34,7 @@ bool sabg_keyboard_model_advance(
 );
 
 bool sabg_keyboard_model_active(const SabgKeyboardModel *model);
+double sabg_keyboard_model_velocity(const SabgKeyboardModel *model);
 
 void sabg_keyboard_model_set_activity_threshold(
     SabgKeyboardModel *model,

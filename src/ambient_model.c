@@ -72,6 +72,7 @@ void sabg_ambient_model_init(
         (double)minimum_percentage,
         (double)maximum_percentage
     );
+    model->filtered_velocity = 0.0;
     model->last_lux = initial_lux;
     model->last_update_usec = now_usec;
     model->initialized = 1;
@@ -136,6 +137,7 @@ double sabg_ambient_model_advance(
     double desired;
     double elapsed_seconds;
     double alpha;
+    double previous;
     double time_constant;
 
     assert(model != NULL);
@@ -148,6 +150,7 @@ double sabg_ambient_model_advance(
         return model->filtered_percentage;
 
     elapsed_seconds = (double)(now_usec - model->last_update_usec) / 1000000.0;
+    previous = model->filtered_percentage;
     if (!model->large_change_active
         && model->large_change_threshold > 0.0
         && fabs(desired - model->filtered_percentage) >= model->large_change_threshold) {
@@ -172,6 +175,9 @@ double sabg_ambient_model_advance(
         && model->filtered_percentage - desired <= model->dimming_finish_distance) {
         model->filtered_percentage = desired;
     }
+    model->filtered_velocity = (
+        model->filtered_percentage - previous
+    ) / elapsed_seconds;
     model->last_update_usec = now_usec;
 
     return model->filtered_percentage;
@@ -196,6 +202,13 @@ bool sabg_ambient_model_active(const SabgAmbientModel *model)
     return fabs(model->filtered_percentage - desired) >= model->activity_threshold;
 }
 
+double sabg_ambient_model_velocity(const SabgAmbientModel *model)
+{
+    assert(model != NULL);
+    assert(model->initialized);
+    return model->filtered_velocity;
+}
+
 void sabg_ambient_model_recalibrate(
     SabgAmbientModel *model,
     double lux,
@@ -215,6 +228,7 @@ void sabg_ambient_model_recalibrate(
 
     set_normalization(model, lux, manual_percentage);
     model->filtered_percentage = (double)manual_percentage;
+    model->filtered_velocity = 0.0;
     model->last_lux = lux;
     model->last_update_usec = now_usec;
     model->large_change_active = false;

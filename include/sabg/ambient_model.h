@@ -7,6 +7,7 @@
 typedef struct {
     double normalization_lux;
     double filtered_percentage;
+    double filtered_velocity;
     double last_lux;
     double time_constant_seconds;
     double dimming_time_constant_seconds;
@@ -66,6 +67,7 @@ double sabg_ambient_model_advance(
 );
 
 bool sabg_ambient_model_active(const SabgAmbientModel *model);
+double sabg_ambient_model_velocity(const SabgAmbientModel *model);
 
 void sabg_ambient_model_recalibrate(
     SabgAmbientModel *model,

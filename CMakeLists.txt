@@ -15,6 +15,7 @@ pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 
 add_library(sabg_core STATIC
   src/ambient_model.c
+  src/frame_scheduler.c
   src/keyboard_model.c
   src/output_quantizer.c
   src/smoother.c
@@ -80,4 +81,8 @@ if(BUILD_TESTING)
   add_executable(test-output-quantizer tests/test_output_quantizer.c)
   target_link_libraries(test-output-quantizer PRIVATE sabg_core)
   add_test(NAME output-quantizer COMMAND test-output-quantizer)
+
+  add_executable(test-frame-scheduler tests/test_frame_scheduler.c)
+  target_link_libraries(test-frame-scheduler PRIVATE sabg_core)
+  add_test(NAME frame-scheduler COMMAND test-frame-scheduler)
 endif()
