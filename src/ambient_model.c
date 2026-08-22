@@ -63,6 +63,10 @@ void sabg_ambient_model_init(
     model->dimming_time_constant_seconds = model->time_constant_seconds;
     model->dimming_finish_distance = 0.0;
     model->activity_threshold = 0.005;
+    model->large_change_threshold = 0.0;
+    model->large_change_time_constant_seconds = model->time_constant_seconds;
+    model->large_change_finish_distance = 0.0;
+    model->large_change_active = false;
     model->filtered_percentage = clamp_double(
         (double)initial_percentage,
         (double)minimum_percentage,
@@ -103,6 +107,26 @@ void sabg_ambient_model_set_activity_threshold(
     model->activity_threshold = percentage > 0.005 ? percentage : 0.005;
 }
 
+void sabg_ambient_model_set_large_change_response(
+    SabgAmbientModel *model,
+    double threshold_percentage,
+    double time_constant_seconds,
+    double finish_distance_percentage
+)
+{
+    assert(model != NULL);
+    model->large_change_threshold = threshold_percentage > 0.0
+        ? threshold_percentage
+        : 0.0;
+    model->large_change_time_constant_seconds = time_constant_seconds > 0.0
+        ? time_constant_seconds
+        : 0.001;
+    model->large_change_finish_distance = finish_distance_percentage > 0.0
+        ? finish_distance_percentage
+        : 0.0;
+    model->large_change_active = false;
+}
+
 double sabg_ambient_model_advance(
     SabgAmbientModel *model,
     double lux,
@@ -124,11 +148,26 @@ double sabg_ambient_model_advance(
         return model->filtered_percentage;
 
     elapsed_seconds = (double)(now_usec - model->last_update_usec) / 1000000.0;
-    time_constant = desired < model->filtered_percentage
-        ? model->dimming_time_constant_seconds
-        : model->time_constant_seconds;
+    if (!model->large_change_active
+        && model->large_change_threshold > 0.0
+        && fabs(desired - model->filtered_percentage) >= model->large_change_threshold) {
+        model->large_change_active = true;
+    }
+    if (model->large_change_active) {
+        time_constant = model->large_change_time_constant_seconds;
+    } else {
+        time_constant = desired < model->filtered_percentage
+            ? model->dimming_time_constant_seconds
+            : model->time_constant_seconds;
+    }
     alpha = 1.0 - exp(-elapsed_seconds / time_constant);
     model->filtered_percentage += alpha * (desired - model->filtered_percentage);
+    if (model->large_change_active
+        && fabs(model->filtered_percentage - desired)
+            <= model->large_change_finish_distance) {
+        model->filtered_percentage = desired;
+        model->large_change_active = false;
+    }
     if (desired < model->filtered_percentage
         && model->filtered_percentage - desired <= model->dimming_finish_distance) {
         model->filtered_percentage = desired;
@@ -178,4 +217,5 @@ void sabg_ambient_model_recalibrate(
     model->filtered_percentage = (double)manual_percentage;
     model->last_lux = lux;
     model->last_update_usec = now_usec;
+    model->large_change_active = false;
 }

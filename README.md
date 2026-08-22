@@ -122,8 +122,8 @@ systemctl --user restart smooth-autobrightness-for-gnome.service
 - Brightening envelope time constant: 1.6 seconds
 - Dimming envelope time constant: approximately 0.53 seconds
 - Final 4-point dimming tail: handed to the bounded trajectory controller
-- Brightening: one percentage point every 40 ms
-- Dimming: one percentage point every 60 ms
+- Gradual brightening and dimming: one percentage point every 40 ms
+- Changes of 12 percentage points or more: accelerated catch-up response
 - Maximum transition duration: 250 ms
 - Maximum active update rate: 60 Hz
 - Target hysteresis: 2 percentage points, with reachable 0%/100% endpoints
@@ -135,7 +135,7 @@ systemctl --user restart smooth-autobrightness-for-gnome.service
 - Manual keyboard off: suspend keyboard automation until manually raised above zero
 - Automatic keyboard zero: remain active and brighten again when the room darkens
 
-Short trajectory corrections retain the natural 40/60 ms-per-point timing.
+Short trajectory corrections retain the natural 40 ms-per-point timing.
 Larger corrections are compressed to 250 ms. Retargeting preserves velocity,
 and output is quantized to actual integer brightness changes at no more than
 60 updates per second, avoiding high-rate D-Bus traffic while keeping large

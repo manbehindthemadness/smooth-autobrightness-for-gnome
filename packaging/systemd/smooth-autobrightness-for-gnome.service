@@ -10,8 +10,12 @@ Environment=SABG_OPTIONS=
 ExecStart=/usr/local/bin/smooth-autobrightness-for-gnome $SABG_OPTIONS
 Restart=on-failure
 RestartSec=2
-Nice=10
-CPUWeight=10
+Nice=0
+CPUWeight=200
+CPUQuota=5%
+CPUQuotaPeriodSec=100ms
+MemoryMax=32M
+TasksMax=4
 IOWeight=10
 NoNewPrivileges=yes
 PrivateTmp=yes

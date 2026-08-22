@@ -40,6 +40,13 @@ void sabg_keyboard_model_set_activity_threshold(
     double percentage
 );
 
+void sabg_keyboard_model_set_large_change_response(
+    SabgKeyboardModel *model,
+    double threshold_percentage,
+    double time_constant_seconds,
+    double finish_distance_percentage
+);
+
 void sabg_keyboard_model_manual_change(
     SabgKeyboardModel *model,
     double lux,

@@ -40,6 +40,9 @@
 /* Dimming needs a shorter envelope because sparse low-end panel steps expose its tail. */
 #define TRAJECTORY_DIMMING_TIME_CONSTANT_FACTOR (1.0 / 3.0)
 #define TRAJECTORY_DIMMING_FINISH_DISTANCE 4.0
+#define LARGE_CHANGE_THRESHOLD 12.0
+#define LARGE_CHANGE_TIME_CONSTANT_FACTOR 0.14
+#define LARGE_CHANGE_FINISH_DISTANCE 4.0
 
 typedef enum {
     KEYBOARD_BACKEND_NONE,
@@ -209,7 +212,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
 
     *configuration = (Configuration){
         .brighten_step_ms = 40,
-        .dim_step_ms = 60,
+        .dim_step_ms = 40,
         .maximum_transition_ms = 250,
         .hysteresis_percentage = 2,
         .apple_refresh_ms = 500,
@@ -1370,6 +1373,13 @@ static int application_start(Application *application)
             &application->ambient,
             (double)application->configuration.hysteresis_percentage
         );
+        sabg_ambient_model_set_large_change_response(
+            &application->ambient,
+            LARGE_CHANGE_THRESHOLD,
+            application->configuration.ambient_time_constant_seconds
+                * LARGE_CHANGE_TIME_CONSTANT_FACTOR,
+            LARGE_CHANGE_FINISH_DISTANCE
+        );
     }
     sabg_trajectory_init(
         &application->display_trajectory,
@@ -1416,6 +1426,13 @@ static int application_start(Application *application)
             sabg_keyboard_model_set_activity_threshold(
                 &application->keyboard_model,
                 (double)application->configuration.hysteresis_percentage
+            );
+            sabg_keyboard_model_set_large_change_response(
+                &application->keyboard_model,
+                LARGE_CHANGE_THRESHOLD,
+                application->configuration.ambient_time_constant_seconds
+                    * LARGE_CHANGE_TIME_CONSTANT_FACTOR,
+                LARGE_CHANGE_FINISH_DISTANCE
             );
         }
         sabg_trajectory_init(

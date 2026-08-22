@@ -12,10 +12,14 @@ typedef struct {
     double dimming_time_constant_seconds;
     double dimming_finish_distance;
     double activity_threshold;
+    double large_change_threshold;
+    double large_change_time_constant_seconds;
+    double large_change_finish_distance;
     uint64_t last_update_usec;
     int minimum_percentage;
     int maximum_percentage;
     int initialized;
+    bool large_change_active;
 } SabgAmbientModel;
 
 void sabg_ambient_model_set_dimming_time_constant(
@@ -31,6 +35,13 @@ void sabg_ambient_model_set_dimming_finish_distance(
 void sabg_ambient_model_set_activity_threshold(
     SabgAmbientModel *model,
     double percentage
+);
+
+void sabg_ambient_model_set_large_change_response(
+    SabgAmbientModel *model,
+    double threshold_percentage,
+    double time_constant_seconds,
+    double finish_distance_percentage
 );
 
 void sabg_ambient_model_init(

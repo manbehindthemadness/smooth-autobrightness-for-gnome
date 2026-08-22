@@ -65,5 +65,14 @@ int main(void)
     model.filtered_percentage = 97.0;
     assert(sabg_ambient_model_active(&model));
 
+    sabg_ambient_model_init(&model, 100.0, 2, 1.6, 2, 100, UINT64_C(0));
+    sabg_ambient_model_set_large_change_response(&model, 12.0, 0.224, 4.0);
+    assert(sabg_ambient_model_advance(&model, 500.0, UINT64_C(100000)) < 3.0);
+    assert(!model.large_change_active);
+    assert(sabg_ambient_model_advance(&model, 5000.0, UINT64_C(200000)) > 30.0);
+    assert(model.large_change_active);
+    assert(sabg_ambient_model_advance(&model, 5000.0, UINT64_C(1000000)) == 100.0);
+    assert(!model.large_change_active);
+
     return 0;
 }

@@ -91,6 +91,22 @@ void sabg_keyboard_model_set_activity_threshold(
     sabg_ambient_model_set_activity_threshold(&model->inverse_ambient, percentage);
 }
 
+void sabg_keyboard_model_set_large_change_response(
+    SabgKeyboardModel *model,
+    double threshold_percentage,
+    double time_constant_seconds,
+    double finish_distance_percentage
+)
+{
+    assert(model != NULL);
+    sabg_ambient_model_set_large_change_response(
+        &model->inverse_ambient,
+        threshold_percentage,
+        time_constant_seconds,
+        finish_distance_percentage
+    );
+}
+
 void sabg_keyboard_model_manual_change(
     SabgKeyboardModel *model,
     double lux,
