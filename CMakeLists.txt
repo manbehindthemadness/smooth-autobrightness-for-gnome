@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 
 project(
   smooth-autobrightness-for-gnome
-  VERSION 0.2.0
+  VERSION 0.3.0
   DESCRIPTION "Low-overhead smooth ambient-light brightness for GNOME"
   LANGUAGES C
 )
@@ -15,6 +15,7 @@ pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 
 add_library(sabg_core STATIC
   src/ambient_model.c
+  src/keyboard_model.c
   src/smoother.c
   src/write_tracker.c
 )
@@ -59,4 +60,8 @@ if(BUILD_TESTING)
   add_executable(test-write-tracker tests/test_write_tracker.c)
   target_link_libraries(test-write-tracker PRIVATE sabg_core)
   add_test(NAME write-tracker COMMAND test-write-tracker)
+
+  add_executable(test-keyboard-model tests/test_keyboard_model.c)
+  target_link_libraries(test-keyboard-model PRIVATE sabg_core)
+  add_test(NAME keyboard-model COMMAND test-keyboard-model)
 endif()

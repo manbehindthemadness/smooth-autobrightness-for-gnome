@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include "sabg/ambient_model.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+typedef struct {
+    SabgAmbientModel inverse_ambient;
+    bool suspended_by_user;
+} SabgKeyboardModel;
+
+void sabg_keyboard_model_init(
+    SabgKeyboardModel *model,
+    double initial_lux,
+    int initial_percentage,
+    double time_constant_seconds,
+    uint64_t now_usec
+);
+
+bool sabg_keyboard_model_observe(
+    SabgKeyboardModel *model,
+    double lux,
+    uint64_t now_usec,
+    int *target_percentage
+);
+
+void sabg_keyboard_model_manual_change(
+    SabgKeyboardModel *model,
+    double lux,
+    int manual_percentage,
+    uint64_t now_usec
+);
+

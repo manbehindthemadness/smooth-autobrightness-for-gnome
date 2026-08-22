@@ -1,9 +1,9 @@
 # Smooth Auto Brightness for GNOME
 
-Smooth Auto Brightness for GNOME replaces only GNOME's ambient-light brightness
-policy with low-overhead, gradual panel transitions. Manual brightness keys and
-the GNOME slider remain immediate and continue to recalibrate the automatic
-brightness baseline.
+Smooth Auto Brightness for GNOME replaces GNOME's ambient-light brightness
+policy with low-overhead, gradual transitions for the display and keyboard
+backlight. Manual controls remain immediate and independently recalibrate each
+backlight's automatic baseline.
 
 The daemon is native C and event-driven. At rest it performs no periodic work
 unless an explicitly enabled hardware keepalive requires it. During a
@@ -19,10 +19,14 @@ control a display.
 
 - `net.hadess.SensorProxy` on the system D-Bus for ambient lux readings
 - `org.gnome.SettingsDaemon.Power.Screen` on the session D-Bus for brightness
+- `org.gnome.SettingsDaemon.Power.Keyboard` for keyboard illumination when available
+- `org.freedesktop.UPower.KbdBacklight` as the portable keyboard fallback
 - `sd-event` one-shot timers for transitions and optional sensor keepalives
 
-No GNOME Shell extension, direct backlight write permission, or root daemon is
-required.
+The keyboard adapter discovers the desktop interface first and then UPower,
+including UPower's newer per-device object enumeration. Native hardware ranges
+are normalized to percentages; no vendor-specific LED name is assumed. No
+GNOME Shell extension, direct sysfs write permission, or root daemon is required.
 
 ## Build
 
@@ -120,7 +124,12 @@ systemctl --user restart smooth-autobrightness-for-gnome.service
 - Maximum transition duration: 250 ms
 - Maximum active update rate: 60 Hz
 - Automatic range: 2–100 percent
-- Manual changes: immediate, cancel the current transition, and recalibrate
+- Display response: brighter environment means a brighter display
+- Keyboard response: darker environment means brighter key illumination
+- Display and keyboard baselines: independent
+- Manual changes: immediate, cancel only that device's transition, and recalibrate
+- Manual keyboard off: suspend keyboard automation until manually raised above zero
+- Automatic keyboard zero: remain active and brighten again when the room darkens
 
 Short transitions retain the natural 40/60 ms-per-point timing. Longer
 transitions are compressed to 250 ms and use no more than 60 updates per
@@ -130,6 +139,10 @@ responsive.
 The transition cap, natural step rates, ambient filter, and automatic range are
 configurable from the command line; see `--help`. The 60 Hz update ceiling is
 an internal safety limit.
+
+Keyboard control is enabled when a supported interface is present. Disable it
+without affecting display automation with `--no-keyboard-backlight`. Systems
+without a keyboard backlight continue with display-only operation.
 
 ## License
 
