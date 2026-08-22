@@ -3,6 +3,7 @@
 
 #undef NDEBUG
 #include <assert.h>
+#include <math.h>
 #include <stdint.h>
 
 int main(void)
@@ -41,6 +42,28 @@ int main(void)
     assert(model.filtered_percentage == 5.0);
     sabg_ambient_model_recalibrate(&model, 10.0, 500, UINT64_C(3000020));
     assert(model.filtered_percentage == 80.0);
+
+    sabg_ambient_model_init(&model, 100.0, 20, 3.0, 2, 100, UINT64_C(0));
+    sabg_ambient_model_set_dimming_time_constant(&model, 0.5);
+    assert(fabs(
+        sabg_ambient_model_advance(&model, 0.0, UINT64_C(500000))
+        - (20.0 + (2.0 - 20.0) * (1.0 - exp(-1.0)))
+    ) < 0.001);
+    sabg_ambient_model_set_dimming_finish_distance(&model, 4.0);
+    model.filtered_percentage = 6.1;
+    model.last_update_usec = UINT64_C(500000);
+    assert(sabg_ambient_model_advance(&model, 0.0, UINT64_C(600000)) == 2.0);
+    model.filtered_percentage = 20.0;
+    model.last_update_usec = UINT64_C(600000);
+    assert(fabs(
+        sabg_ambient_model_advance(&model, 500.0, UINT64_C(1100000))
+        - (20.0 + (100.0 - 20.0) * (1.0 - exp(-0.5 / 3.0)))
+    ) < 0.001);
+    sabg_ambient_model_set_activity_threshold(&model, 2.0);
+    model.filtered_percentage = 99.0;
+    assert(!sabg_ambient_model_active(&model));
+    model.filtered_percentage = 97.0;
+    assert(sabg_ambient_model_active(&model));
 
     return 0;
 }

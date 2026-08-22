@@ -7,8 +7,9 @@ backlight's automatic baseline.
 
 The daemon is native C and event-driven. At rest it performs no periodic work
 unless an explicitly enabled hardware keepalive requires it. During a
-transition it uses deadline-based, frame-limited interpolation; it does not run
-a fixed-rate loop while idle.
+transition it uses a velocity-preserving, frame-limited trajectory and writes
+only when the panel's integer brightness changes; it does not run a fixed-rate
+loop while idle.
 
 ## Status
 
@@ -118,7 +119,9 @@ systemctl --user restart smooth-autobrightness-for-gnome.service
 
 ## Default policy
 
-- Ambient target filter time constant: 1.6 seconds
+- Brightening envelope time constant: 1.6 seconds
+- Dimming envelope time constant: approximately 0.53 seconds
+- Final 4-point dimming tail: handed to the bounded trajectory controller
 - Brightening: one percentage point every 40 ms
 - Dimming: one percentage point every 60 ms
 - Maximum transition duration: 250 ms
@@ -132,15 +135,17 @@ systemctl --user restart smooth-autobrightness-for-gnome.service
 - Manual keyboard off: suspend keyboard automation until manually raised above zero
 - Automatic keyboard zero: remain active and brighten again when the room darkens
 
-Short transitions retain the natural 40/60 ms-per-point timing. Longer
-transitions are compressed to 250 ms and use no more than 60 updates per
-second, avoiding high-rate D-Bus traffic while keeping large changes
-responsive.
+Short trajectory corrections retain the natural 40/60 ms-per-point timing.
+Larger corrections are compressed to 250 ms. Retargeting preserves velocity,
+and output is quantized to actual integer brightness changes at no more than
+60 updates per second, avoiding high-rate D-Bus traffic while keeping large
+changes responsive.
 
 The transition cap, natural step rates, ambient filter, hysteresis, and
 automatic range are configurable from the command line; see `--help`. Set
-`--hysteresis 0` to disable target hysteresis. The 60 Hz update ceiling is an
-internal safety limit.
+`--hysteresis 0` to disable output hysteresis. The 60 Hz update ceiling is an
+internal safety limit. `--legacy-transitions` temporarily retains the pre-0.4
+restarted-fade controller for compatibility testing.
 
 Keyboard control is enabled when a supported interface is present. Disable it
 without affecting display automation with `--no-keyboard-backlight`. Systems

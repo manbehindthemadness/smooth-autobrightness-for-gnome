@@ -2,8 +2,10 @@
 #include "apple_als_keepalive.h"
 #include "sabg/ambient_model.h"
 #include "sabg/keyboard_model.h"
+#include "sabg/output_quantizer.h"
 #include "sabg/smoother.h"
 #include "sabg/target_hysteresis.h"
+#include "sabg/trajectory.h"
 #include "sabg/write_tracker.h"
 
 #include <errno.h>
@@ -20,8 +22,6 @@
 #include <systemd/sd-event.h>
 #include <time.h>
 
-#define VERSION "0.3.1"
-
 #define SENSOR_DESTINATION "net.hadess.SensorProxy"
 #define SENSOR_PATH "/net/hadess/SensorProxy"
 #define SENSOR_INTERFACE "net.hadess.SensorProxy"
@@ -36,6 +36,10 @@
 #define UPOWER_INTERFACE "org.freedesktop.UPower"
 #define UPOWER_KEYBOARD_PATH "/org/freedesktop/UPower/KbdBacklight"
 #define UPOWER_KEYBOARD_INTERFACE "org.freedesktop.UPower.KbdBacklight"
+#define MOTION_UPDATE_HZ UINT64_C(60)
+/* Dimming needs a shorter envelope because sparse low-end panel steps expose its tail. */
+#define TRAJECTORY_DIMMING_TIME_CONSTANT_FACTOR (1.0 / 3.0)
+#define TRAJECTORY_DIMMING_FINISH_DISTANCE 4.0
 
 typedef enum {
     KEYBOARD_BACKEND_NONE,
@@ -53,6 +57,7 @@ typedef struct {
     int minimum_percentage;
     int maximum_percentage;
     bool keyboard_backlight;
+    bool legacy_transitions;
     bool apple_keepalive;
     bool check_only;
     bool dry_run;
@@ -65,6 +70,7 @@ typedef struct {
     sd_event *event;
     sd_event_source *animation_timer;
     sd_event_source *keyboard_animation_timer;
+    sd_event_source *motion_timer;
     sd_bus *system_bus;
     sd_bus *session_bus;
     sd_bus_slot *sensor_properties_slot;
@@ -78,6 +84,10 @@ typedef struct {
     SabgSmoother keyboard_smoother;
     SabgTargetHysteresis keyboard_target_hysteresis;
     SabgWriteTracker keyboard_write_tracker;
+    SabgTrajectory display_trajectory;
+    SabgTrajectory keyboard_trajectory;
+    SabgOutputQuantizer display_quantizer;
+    SabgOutputQuantizer keyboard_quantizer;
     SabgAppleAlsKeepalive keepalive;
     double current_lux;
     bool light_claimed;
@@ -141,6 +151,7 @@ static void print_usage(FILE *stream, const char *program)
         "  --min-brightness N         automatic floor (default: 2)\n"
         "  --max-brightness N         automatic ceiling (default: 100)\n"
         "  --no-keyboard-backlight    leave keyboard illumination unchanged\n"
+        "  --legacy-transitions       use the pre-0.4 restarted-fade controller\n"
         "  --apple-als-keepalive      enable optional Apple IIO refreshes\n"
         "  --apple-als-path PATH      refresh a specific IIO illuminance file\n"
         "  --apple-refresh-ms N       refresh interval (default: 500)\n"
@@ -164,6 +175,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
         OPTION_MIN_BRIGHTNESS,
         OPTION_MAX_BRIGHTNESS,
         OPTION_NO_KEYBOARD_BACKLIGHT,
+        OPTION_LEGACY_TRANSITIONS,
         OPTION_APPLE_KEEPALIVE,
         OPTION_APPLE_PATH,
         OPTION_APPLE_REFRESH,
@@ -181,6 +193,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
         {"min-brightness", required_argument, NULL, OPTION_MIN_BRIGHTNESS},
         {"max-brightness", required_argument, NULL, OPTION_MAX_BRIGHTNESS},
         {"no-keyboard-backlight", no_argument, NULL, OPTION_NO_KEYBOARD_BACKLIGHT},
+        {"legacy-transitions", no_argument, NULL, OPTION_LEGACY_TRANSITIONS},
         {"apple-als-keepalive", no_argument, NULL, OPTION_APPLE_KEEPALIVE},
         {"apple-als-path", required_argument, NULL, OPTION_APPLE_PATH},
         {"apple-refresh-ms", required_argument, NULL, OPTION_APPLE_REFRESH},
@@ -243,6 +256,9 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
         case OPTION_NO_KEYBOARD_BACKLIGHT:
             configuration->keyboard_backlight = false;
             break;
+        case OPTION_LEGACY_TRANSITIONS:
+            configuration->legacy_transitions = true;
+            break;
         case OPTION_APPLE_KEEPALIVE:
             configuration->apple_keepalive = true;
             break;
@@ -265,7 +281,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
             configuration->verbose = true;
             break;
         case OPTION_VERSION:
-            printf("smooth-autobrightness-for-gnome %s\n", VERSION);
+            printf("smooth-autobrightness-for-gnome %s\n", SABG_VERSION);
             exit(EXIT_SUCCESS);
         case 'h':
             print_usage(stdout, argv[0]);
@@ -891,6 +907,14 @@ static int on_keyboard_brightness(sd_bus_message *message, void *userdata, sd_bu
         &application->keyboard_target_hysteresis,
         percentage
     );
+    if (!application->configuration.legacy_transitions) {
+        sabg_trajectory_reset(
+            &application->keyboard_trajectory,
+            percentage,
+            monotonic_usec()
+        );
+        sabg_output_quantizer_reset(&application->keyboard_quantizer, percentage);
+    }
     if (application->keyboard_animation_timer != NULL)
         sd_event_source_set_enabled(application->keyboard_animation_timer, SD_EVENT_OFF);
     sabg_keyboard_model_manual_change(
@@ -914,6 +938,124 @@ static int on_keyboard_brightness(sd_bus_message *message, void *userdata, sd_bu
     return 0;
 }
 
+static bool motion_active(const Application *application)
+{
+    return sabg_ambient_model_active(&application->ambient)
+        || sabg_trajectory_active(&application->display_trajectory)
+        || (application->keyboard_model_ready
+            && (sabg_keyboard_model_active(&application->keyboard_model)
+                || sabg_trajectory_active(&application->keyboard_trajectory)));
+}
+
+static int schedule_motion_update(Application *application, uint64_t now_usec);
+
+static int update_motion(
+    Application *application,
+    double lux,
+    uint64_t now_usec,
+    bool log_target
+)
+{
+    double display_target;
+    double keyboard_target = 0.0;
+    double position;
+    int output;
+    int result;
+
+    display_target = sabg_ambient_model_advance(&application->ambient, lux, now_usec);
+    sabg_trajectory_set_target(&application->display_trajectory, display_target, now_usec);
+    position = sabg_trajectory_advance(&application->display_trajectory, now_usec);
+    if (log_target && application->configuration.verbose) {
+        fprintf(
+            stderr,
+            "ambient %.2f lux -> envelope %.2f%%, display %.2f%% at %.2f%%/s\n",
+            lux,
+            display_target,
+            position,
+            application->display_trajectory.velocity
+        );
+    }
+    if (sabg_output_quantizer_update(&application->display_quantizer, position, &output)) {
+        result = write_brightness(application, output);
+        if (result < 0)
+            return result;
+    }
+
+    if (application->keyboard_model_ready
+        && sabg_keyboard_model_advance(
+            &application->keyboard_model,
+            lux,
+            now_usec,
+            &keyboard_target
+        )) {
+        sabg_trajectory_set_target(
+            &application->keyboard_trajectory,
+            keyboard_target,
+            now_usec
+        );
+        position = sabg_trajectory_advance(&application->keyboard_trajectory, now_usec);
+        if (log_target && application->configuration.verbose) {
+            fprintf(
+                stderr,
+                "ambient %.2f lux -> keyboard envelope %.2f%%, position %.2f%% at %.2f%%/s\n",
+                lux,
+                keyboard_target,
+                position,
+                application->keyboard_trajectory.velocity
+            );
+        }
+        if (sabg_output_quantizer_update(
+            &application->keyboard_quantizer,
+            position,
+            &output
+        )) {
+            result = write_keyboard_brightness(application, output);
+            if (result < 0)
+                return result;
+        }
+    }
+
+    if (motion_active(application))
+        return schedule_motion_update(application, now_usec);
+    return 0;
+}
+
+static int on_motion_timer(sd_event_source *source, uint64_t usec, void *userdata)
+{
+    Application *application = userdata;
+
+    (void)source;
+    (void)usec;
+    return update_motion(
+        application,
+        application->current_lux,
+        monotonic_usec(),
+        false
+    );
+}
+
+static int schedule_motion_update(Application *application, uint64_t now_usec)
+{
+    uint64_t wakeup_usec = now_usec + UINT64_C(1000000) / MOTION_UPDATE_HZ;
+    int result;
+
+    if (application->motion_timer == NULL) {
+        return sd_event_add_time(
+            application->event,
+            &application->motion_timer,
+            CLOCK_MONOTONIC,
+            wakeup_usec,
+            UINT64_C(1000),
+            on_motion_timer,
+            application
+        );
+    }
+    result = sd_event_source_set_time(application->motion_timer, wakeup_usec);
+    if (result < 0)
+        return result;
+    return sd_event_source_set_enabled(application->motion_timer, SD_EVENT_ONESHOT);
+}
+
 static int on_sensor_properties(sd_bus_message *message, void *userdata, sd_bus_error *error)
 {
     Application *application = userdata;
@@ -934,6 +1076,8 @@ static int on_sensor_properties(sd_bus_message *message, void *userdata, sd_bus_
         return 0;
 
     now_usec = monotonic_usec();
+    if (!application->configuration.legacy_transitions)
+        return update_motion(application, lux, now_usec, true);
     target = sabg_ambient_model_observe(&application->ambient, lux, now_usec);
     if (application->configuration.verbose)
         fprintf(stderr, "ambient %.2f lux -> target %d%%\n", lux, target);
@@ -991,6 +1135,14 @@ static int on_brightness_properties(sd_bus_message *message, void *userdata, sd_
     sabg_write_tracker_clear(&application->write_tracker);
     sabg_smoother_reset(&application->smoother, percentage);
     sabg_target_hysteresis_reset(&application->target_hysteresis, percentage);
+    if (!application->configuration.legacy_transitions) {
+        sabg_trajectory_reset(
+            &application->display_trajectory,
+            percentage,
+            monotonic_usec()
+        );
+        sabg_output_quantizer_reset(&application->display_quantizer, percentage);
+    }
     if (application->animation_timer != NULL)
         sd_event_source_set_enabled(application->animation_timer, SD_EVENT_OFF);
     sabg_ambient_model_recalibrate(
@@ -1204,6 +1356,38 @@ static int application_start(Application *application)
         application->configuration.maximum_percentage,
         now_usec
     );
+    if (!application->configuration.legacy_transitions) {
+        sabg_ambient_model_set_dimming_time_constant(
+            &application->ambient,
+            application->configuration.ambient_time_constant_seconds
+                * TRAJECTORY_DIMMING_TIME_CONSTANT_FACTOR
+        );
+        sabg_ambient_model_set_dimming_finish_distance(
+            &application->ambient,
+            TRAJECTORY_DIMMING_FINISH_DISTANCE
+        );
+        sabg_ambient_model_set_activity_threshold(
+            &application->ambient,
+            (double)application->configuration.hysteresis_percentage
+        );
+    }
+    sabg_trajectory_init(
+        &application->display_trajectory,
+        brightness,
+        application->configuration.brighten_step_ms,
+        application->configuration.dim_step_ms,
+        application->configuration.maximum_transition_ms,
+        application->configuration.minimum_percentage,
+        application->configuration.maximum_percentage,
+        now_usec
+    );
+    sabg_output_quantizer_init(
+        &application->display_quantizer,
+        brightness,
+        application->configuration.minimum_percentage,
+        application->configuration.maximum_percentage,
+        application->configuration.hysteresis_percentage
+    );
     application->model_ready = true;
 
     if (application->keyboard_backend != KEYBOARD_BACKEND_NONE) {
@@ -1227,6 +1411,29 @@ static int application_start(Application *application)
             keyboard_brightness,
             application->configuration.ambient_time_constant_seconds,
             now_usec
+        );
+        if (!application->configuration.legacy_transitions) {
+            sabg_keyboard_model_set_activity_threshold(
+                &application->keyboard_model,
+                (double)application->configuration.hysteresis_percentage
+            );
+        }
+        sabg_trajectory_init(
+            &application->keyboard_trajectory,
+            keyboard_brightness,
+            application->configuration.brighten_step_ms,
+            application->configuration.dim_step_ms,
+            application->configuration.maximum_transition_ms,
+            0,
+            100,
+            now_usec
+        );
+        sabg_output_quantizer_init(
+            &application->keyboard_quantizer,
+            keyboard_brightness,
+            0,
+            100,
+            application->configuration.hysteresis_percentage
         );
         application->keyboard_model_ready = true;
     }
@@ -1291,6 +1498,7 @@ static void application_destroy(Application *application)
     sabg_apple_als_keepalive_destroy(&application->keepalive);
     application->animation_timer = sd_event_source_unref(application->animation_timer);
     application->keyboard_animation_timer = sd_event_source_unref(application->keyboard_animation_timer);
+    application->motion_timer = sd_event_source_unref(application->motion_timer);
     application->sensor_properties_slot = sd_bus_slot_unref(application->sensor_properties_slot);
     application->brightness_properties_slot = sd_bus_slot_unref(application->brightness_properties_slot);
     application->keyboard_brightness_slot = sd_bus_slot_unref(application->keyboard_brightness_slot);

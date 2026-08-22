@@ -26,10 +26,23 @@ bool sabg_keyboard_model_observe(
     int *target_percentage
 );
 
+bool sabg_keyboard_model_advance(
+    SabgKeyboardModel *model,
+    double lux,
+    uint64_t now_usec,
+    double *target_percentage
+);
+
+bool sabg_keyboard_model_active(const SabgKeyboardModel *model);
+
+void sabg_keyboard_model_set_activity_threshold(
+    SabgKeyboardModel *model,
+    double percentage
+);
+
 void sabg_keyboard_model_manual_change(
     SabgKeyboardModel *model,
     double lux,
     int manual_percentage,
     uint64_t now_usec
 );
-

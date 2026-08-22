@@ -19,6 +19,15 @@ static int round_percentage(double value)
     return (int)lround(value);
 }
 
+static double desired_percentage(const SabgAmbientModel *model, double lux)
+{
+    return clamp_double(
+        lux * 100.0 / model->normalization_lux,
+        (double)model->minimum_percentage,
+        (double)model->maximum_percentage
+    );
+}
+
 static void set_normalization(
     SabgAmbientModel *model,
     double lux,
@@ -51,6 +60,9 @@ void sabg_ambient_model_init(
     model->time_constant_seconds = time_constant_seconds > 0.0
         ? time_constant_seconds
         : 0.001;
+    model->dimming_time_constant_seconds = model->time_constant_seconds;
+    model->dimming_finish_distance = 0.0;
+    model->activity_threshold = 0.005;
     model->filtered_percentage = clamp_double(
         (double)initial_percentage,
         (double)minimum_percentage,
@@ -62,7 +74,36 @@ void sabg_ambient_model_init(
     set_normalization(model, initial_lux, initial_percentage);
 }
 
-int sabg_ambient_model_observe(
+void sabg_ambient_model_set_dimming_time_constant(
+    SabgAmbientModel *model,
+    double time_constant_seconds
+)
+{
+    assert(model != NULL);
+    model->dimming_time_constant_seconds = time_constant_seconds > 0.0
+        ? time_constant_seconds
+        : 0.001;
+}
+
+void sabg_ambient_model_set_dimming_finish_distance(
+    SabgAmbientModel *model,
+    double percentage
+)
+{
+    assert(model != NULL);
+    model->dimming_finish_distance = percentage > 0.0 ? percentage : 0.0;
+}
+
+void sabg_ambient_model_set_activity_threshold(
+    SabgAmbientModel *model,
+    double percentage
+)
+{
+    assert(model != NULL);
+    model->activity_threshold = percentage > 0.005 ? percentage : 0.005;
+}
+
+double sabg_ambient_model_advance(
     SabgAmbientModel *model,
     double lux,
     uint64_t now_usec
@@ -71,27 +112,49 @@ int sabg_ambient_model_observe(
     double desired;
     double elapsed_seconds;
     double alpha;
+    double time_constant;
 
     assert(model != NULL);
     assert(model->initialized);
 
     model->last_lux = lux;
-    desired = lux * 100.0 / model->normalization_lux;
-    desired = clamp_double(
-        desired,
-        (double)model->minimum_percentage,
-        (double)model->maximum_percentage
-    );
+    desired = desired_percentage(model, lux);
 
     if (now_usec <= model->last_update_usec)
-        return round_percentage(model->filtered_percentage);
+        return model->filtered_percentage;
 
     elapsed_seconds = (double)(now_usec - model->last_update_usec) / 1000000.0;
-    alpha = 1.0 - exp(-elapsed_seconds / model->time_constant_seconds);
+    time_constant = desired < model->filtered_percentage
+        ? model->dimming_time_constant_seconds
+        : model->time_constant_seconds;
+    alpha = 1.0 - exp(-elapsed_seconds / time_constant);
     model->filtered_percentage += alpha * (desired - model->filtered_percentage);
+    if (desired < model->filtered_percentage
+        && model->filtered_percentage - desired <= model->dimming_finish_distance) {
+        model->filtered_percentage = desired;
+    }
     model->last_update_usec = now_usec;
 
-    return round_percentage(model->filtered_percentage);
+    return model->filtered_percentage;
+}
+
+int sabg_ambient_model_observe(
+    SabgAmbientModel *model,
+    double lux,
+    uint64_t now_usec
+)
+{
+    return round_percentage(sabg_ambient_model_advance(model, lux, now_usec));
+}
+
+bool sabg_ambient_model_active(const SabgAmbientModel *model)
+{
+    double desired;
+
+    assert(model != NULL);
+    assert(model->initialized);
+    desired = desired_percentage(model, model->last_lux);
+    return fabs(model->filtered_percentage - desired) >= model->activity_threshold;
 }
 
 void sabg_ambient_model_recalibrate(

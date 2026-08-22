@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 
 project(
   smooth-autobrightness-for-gnome
-  VERSION 0.3.1
+  VERSION 0.4.0
   DESCRIPTION "Low-overhead smooth ambient-light brightness for GNOME"
   LANGUAGES C
 )
@@ -16,8 +16,10 @@ pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 add_library(sabg_core STATIC
   src/ambient_model.c
   src/keyboard_model.c
+  src/output_quantizer.c
   src/smoother.c
   src/target_hysteresis.c
+  src/trajectory.c
   src/write_tracker.c
 )
 target_include_directories(sabg_core PUBLIC include)
@@ -34,6 +36,7 @@ add_executable(smooth-autobrightness-for-gnome
 target_compile_features(smooth-autobrightness-for-gnome PRIVATE c_std_17)
 target_compile_definitions(smooth-autobrightness-for-gnome PRIVATE
   _POSIX_C_SOURCE=200809L
+  SABG_VERSION="${PROJECT_VERSION}"
 )
 target_compile_options(smooth-autobrightness-for-gnome PRIVATE
   -Wall -Wextra -Wpedantic -Wconversion -Wshadow
@@ -69,4 +72,12 @@ if(BUILD_TESTING)
   add_executable(test-target-hysteresis tests/test_target_hysteresis.c)
   target_link_libraries(test-target-hysteresis PRIVATE sabg_core)
   add_test(NAME target-hysteresis COMMAND test-target-hysteresis)
+
+  add_executable(test-trajectory tests/test_trajectory.c)
+  target_link_libraries(test-trajectory PRIVATE sabg_core)
+  add_test(NAME trajectory COMMAND test-trajectory)
+
+  add_executable(test-output-quantizer tests/test_output_quantizer.c)
+  target_link_libraries(test-output-quantizer PRIVATE sabg_core)
+  add_test(NAME output-quantizer COMMAND test-output-quantizer)
 endif()
