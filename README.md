@@ -127,7 +127,9 @@ transitions are compressed to 250 ms and use no more than 60 updates per
 second, avoiding high-rate D-Bus traffic while keeping large changes
 responsive.
 
-All values are configurable from the command line; see `--help`.
+The transition cap, natural step rates, ambient filter, and automatic range are
+configurable from the command line; see `--help`. The 60 Hz update ceiling is
+an internal safety limit.
 
 ## License
 
