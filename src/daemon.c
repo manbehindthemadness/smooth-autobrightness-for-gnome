@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "apple_als_keepalive.h"
 #include "sabg/ambient_model.h"
+#include "sabg/display_response.h"
 #include "sabg/frame_scheduler.h"
 #include "sabg/keyboard_model.h"
 #include "sabg/output_quantizer.h"
@@ -69,6 +70,8 @@ typedef struct {
     bool dry_run;
     bool verbose;
     const char *apple_als_path;
+    const char *calibration_profile;
+    bool calibration_profile_disabled;
 } Configuration;
 
 typedef struct {
@@ -91,6 +94,7 @@ typedef struct {
     SabgTargetHysteresis keyboard_target_hysteresis;
     SabgWriteTracker keyboard_write_tracker;
     SabgTrajectory display_trajectory;
+    SabgDisplayResponse display_response;
     SabgTrajectory keyboard_trajectory;
     SabgOutputQuantizer display_quantizer;
     SabgOutputQuantizer keyboard_quantizer;
@@ -112,6 +116,32 @@ static uint64_t monotonic_usec(void)
         return 0;
     return (uint64_t)now.tv_sec * UINT64_C(1000000)
         + (uint64_t)now.tv_nsec / UINT64_C(1000);
+}
+
+static const char *default_calibration_profile(char path[PATH_MAX])
+{
+    const char *root = getenv("XDG_CONFIG_HOME");
+    int written;
+
+    if (root != NULL && root[0] != '\0') {
+        written = snprintf(
+            path,
+            PATH_MAX,
+            "%s/smooth-autobrightness-for-gnome/display-calibration.json",
+            root
+        );
+    } else {
+        root = getenv("HOME");
+        if (root == NULL || root[0] == '\0')
+            return NULL;
+        written = snprintf(
+            path,
+            PATH_MAX,
+            "%s/.config/smooth-autobrightness-for-gnome/display-calibration.json",
+            root
+        );
+    }
+    return written >= 0 && written < PATH_MAX ? path : NULL;
 }
 
 static int parse_int(const char *text, int minimum, int maximum, int *value)
@@ -161,6 +191,8 @@ static void print_usage(FILE *stream, const char *program)
         "  --apple-als-keepalive      enable optional Apple IIO refreshes\n"
         "  --apple-als-path PATH      refresh a specific IIO illuminance file\n"
         "  --apple-refresh-ms N       refresh interval (default: 500)\n"
+        "  --calibration-profile PATH use a display response profile\n"
+        "  --no-calibration-profile  ignore the default display response profile\n"
         "  --check                    verify interfaces without changing brightness\n"
         "  --dry-run                  calculate and log without changing brightness\n"
         "  --verbose                  log observations and transitions\n"
@@ -185,6 +217,8 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
         OPTION_APPLE_KEEPALIVE,
         OPTION_APPLE_PATH,
         OPTION_APPLE_REFRESH,
+        OPTION_CALIBRATION_PROFILE,
+        OPTION_NO_CALIBRATION_PROFILE,
         OPTION_CHECK,
         OPTION_DRY_RUN,
         OPTION_VERBOSE,
@@ -203,6 +237,8 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
         {"apple-als-keepalive", no_argument, NULL, OPTION_APPLE_KEEPALIVE},
         {"apple-als-path", required_argument, NULL, OPTION_APPLE_PATH},
         {"apple-refresh-ms", required_argument, NULL, OPTION_APPLE_REFRESH},
+        {"calibration-profile", required_argument, NULL, OPTION_CALIBRATION_PROFILE},
+        {"no-calibration-profile", no_argument, NULL, OPTION_NO_CALIBRATION_PROFILE},
         {"check", no_argument, NULL, OPTION_CHECK},
         {"dry-run", no_argument, NULL, OPTION_DRY_RUN},
         {"verbose", no_argument, NULL, OPTION_VERBOSE},
@@ -276,6 +312,14 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
             if (parse_int(optarg, 50, 60000, &parsed) < 0)
                 return -EINVAL;
             configuration->apple_refresh_ms = (unsigned int)parsed;
+            break;
+        case OPTION_CALIBRATION_PROFILE:
+            configuration->calibration_profile = optarg;
+            configuration->calibration_profile_disabled = false;
+            break;
+        case OPTION_NO_CALIBRATION_PROFILE:
+            configuration->calibration_profile_disabled = true;
+            configuration->calibration_profile = NULL;
             break;
         case OPTION_CHECK:
             configuration->check_only = true;
@@ -982,9 +1026,17 @@ static unsigned int motion_update_rate(
     uint64_t now_usec
 )
 {
+    double display_position = sabg_display_response_to_brightness(
+        &application->display_response,
+        application->display_trajectory.position
+    );
     unsigned int rate = trajectory_update_rate(
         &application->display_trajectory,
-        sabg_ambient_model_velocity(&application->ambient),
+        sabg_ambient_model_velocity(&application->ambient)
+            * sabg_display_response_velocity_scale(
+                &application->display_response,
+                display_position
+            ),
         now_usec
     );
 
@@ -1008,14 +1060,26 @@ static int update_motion(
 )
 {
     double display_target;
+    double display_target_coordinate;
     double keyboard_target = 0.0;
     double position;
     int output;
     int result;
 
     display_target = sabg_ambient_model_advance(&application->ambient, lux, now_usec);
-    sabg_trajectory_set_target(&application->display_trajectory, display_target, now_usec);
-    position = sabg_trajectory_advance(&application->display_trajectory, now_usec);
+    display_target_coordinate = sabg_display_response_to_coordinate(
+        &application->display_response,
+        display_target
+    );
+    sabg_trajectory_set_target(
+        &application->display_trajectory,
+        display_target_coordinate,
+        now_usec
+    );
+    position = sabg_display_response_to_brightness(
+        &application->display_response,
+        sabg_trajectory_advance(&application->display_trajectory, now_usec)
+    );
     if (log_target && application->configuration.verbose) {
         fprintf(
             stderr,
@@ -1024,6 +1088,10 @@ static int update_motion(
             display_target,
             position,
             application->display_trajectory.velocity
+                / sabg_display_response_velocity_scale(
+                    &application->display_response,
+                    position
+                )
         );
     }
     if (sabg_output_quantizer_update(&application->display_quantizer, position, &output)) {
@@ -1190,7 +1258,10 @@ static int on_brightness_properties(sd_bus_message *message, void *userdata, sd_
     if (!application->configuration.legacy_transitions) {
         sabg_trajectory_reset(
             &application->display_trajectory,
-            percentage,
+            sabg_display_response_to_coordinate(
+                &application->display_response,
+                (double)percentage
+            ),
             monotonic_usec()
         );
         sabg_output_quantizer_reset(&application->display_quantizer, percentage);
@@ -1319,6 +1390,8 @@ static int on_exit_signal(sd_event_source *source, const struct signalfd_siginfo
 
 static int application_start(Application *application)
 {
+    char default_profile[PATH_MAX];
+    const char *profile_path = application->configuration.calibration_profile;
     double lux = 0.0;
     int brightness = 0;
     int keyboard_brightness = 0;
@@ -1385,6 +1458,24 @@ static int application_start(Application *application)
 
     application->current_lux = lux;
     now_usec = monotonic_usec();
+    sabg_display_response_init(&application->display_response);
+    if (!application->configuration.calibration_profile_disabled) {
+        if (profile_path == NULL)
+            profile_path = default_calibration_profile(default_profile);
+        if (profile_path != NULL) {
+            result = sabg_display_response_load(&application->display_response, profile_path);
+            if (result == 0) {
+                fprintf(stderr, "Display response profile: %s\n", profile_path);
+            } else if (result != -ENOENT) {
+                fprintf(
+                    stderr,
+                    "Ignoring invalid display response profile %s: %s\n",
+                    profile_path,
+                    strerror(-result)
+                );
+            }
+        }
+    }
     sabg_smoother_init(
         &application->smoother,
         brightness,
@@ -1432,12 +1523,21 @@ static int application_start(Application *application)
     }
     sabg_trajectory_init(
         &application->display_trajectory,
-        brightness,
+        sabg_display_response_to_coordinate(
+            &application->display_response,
+            (double)brightness
+        ),
         application->configuration.brighten_step_ms,
         application->configuration.dim_step_ms,
         application->configuration.maximum_transition_ms,
-        application->configuration.minimum_percentage,
-        application->configuration.maximum_percentage,
+        sabg_display_response_to_coordinate(
+            &application->display_response,
+            (double)application->configuration.minimum_percentage
+        ),
+        sabg_display_response_to_coordinate(
+            &application->display_response,
+            (double)application->configuration.maximum_percentage
+        ),
         now_usec
     );
     sabg_output_quantizer_init(

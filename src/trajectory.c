@@ -23,8 +23,8 @@ void sabg_trajectory_init(
     unsigned int brighten_step_ms,
     unsigned int dim_step_ms,
     unsigned int maximum_transition_ms,
-    int minimum,
-    int maximum,
+    double minimum,
+    double maximum,
     uint64_t now_usec
 )
 {
@@ -142,4 +142,3 @@ void sabg_trajectory_reset(SabgTrajectory *trajectory, double current, uint64_t 
     trajectory->last_update_usec = now_usec;
     trajectory->deadline_usec = now_usec;
 }
-

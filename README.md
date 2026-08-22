@@ -152,6 +152,49 @@ Keyboard control is enabled when a supported interface is present. Disable it
 without affecting display automation with `--no-keyboard-backlight`. Systems
 without a keyboard backlight continue with display-only operation.
 
+## Display response calibration
+
+The optional calibration utility measures the display's real per-step response
+with mirror-reflected ambient-light readings. The profile is a step-salience
+map: coarse hardware jumps can be traversed quickly to mask stair-stepping,
+while fine steps retain the normal aesthetic cadence. It is not intended to
+linearize real-world luminance. The runtime continues using real low backlight
+levels rather than temporal dithering or a power-wasting software dimming
+overlay. The utility requires Python GObject and GTK 4, available on
+Ubuntu/Debian as `python3-gi` and `gir1.2-gtk-4.0`.
+
+Verify the interfaces without changing brightness:
+
+```bash
+smooth-autobrightness-calibrate --check
+```
+
+For a sweep, place the computer in a completely dark room facing a mirror and
+run:
+
+```bash
+smooth-autobrightness-calibrate
+```
+
+The utility presents instructions before entering fullscreen white, temporarily
+stops this daemon and GNOME's ambient policy, measures ascending and descending
+passes, restores the original brightness and services, and writes a monotonic
+profile under `~/.config/smooth-autobrightness-for-gnome/`. Escape cancels and
+restores state. A forced kill or power loss cannot perform restoration.
+
+The daemon automatically loads `display-calibration.json` from that directory
+at startup. It smooths sensor quantization during calibration and uses the
+resulting perceptual coordinate only for transition timing: conspicuous steps
+are crossed sooner, targets still settle on real hardware brightness levels,
+and no level is synthesized. Use `--no-calibration-profile` for an uncalibrated
+comparison or `--calibration-profile PATH` to select another profile. Timing
+metadata in an older completed profile can be regenerated without another
+sweep:
+
+```bash
+smooth-autobrightness-calibrate --refresh-profile
+```
+
 ## License
 
 GPL-3.0-or-later.

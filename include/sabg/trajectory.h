@@ -14,8 +14,8 @@ typedef struct {
     unsigned int maximum_transition_ms;
     uint64_t last_update_usec;
     uint64_t deadline_usec;
-    int minimum;
-    int maximum;
+    double minimum;
+    double maximum;
 } SabgTrajectory;
 
 void sabg_trajectory_init(
@@ -24,8 +24,8 @@ void sabg_trajectory_init(
     unsigned int brighten_step_ms,
     unsigned int dim_step_ms,
     unsigned int maximum_transition_ms,
-    int minimum,
-    int maximum,
+    double minimum,
+    double maximum,
     uint64_t now_usec
 );
 
@@ -38,4 +38,3 @@ void sabg_trajectory_set_target(
 double sabg_trajectory_advance(SabgTrajectory *trajectory, uint64_t now_usec);
 bool sabg_trajectory_active(const SabgTrajectory *trajectory);
 void sabg_trajectory_reset(SabgTrajectory *trajectory, double current, uint64_t now_usec);
-

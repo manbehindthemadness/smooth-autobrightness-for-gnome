@@ -21,6 +21,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
+BindReadOnlyPaths=-%h/.config/smooth-autobrightness-for-gnome/display-calibration.json
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX
