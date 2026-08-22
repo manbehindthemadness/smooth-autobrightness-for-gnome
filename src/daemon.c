@@ -33,6 +33,11 @@
 #define GNOME_SCREEN_INTERFACE "org.gnome.SettingsDaemon.Power.Screen"
 #define GNOME_KEYBOARD_INTERFACE "org.gnome.SettingsDaemon.Power.Keyboard"
 
+#define MUTTER_DISPLAY_DESTINATION "org.gnome.Mutter.DisplayConfig"
+#define MUTTER_DISPLAY_PATH "/org/gnome/Mutter/DisplayConfig"
+#define MUTTER_DISPLAY_INTERFACE "org.gnome.Mutter.DisplayConfig"
+#define MUTTER_POWER_SAVE_ON 0
+
 #define UPOWER_DESTINATION "org.freedesktop.UPower"
 #define UPOWER_PATH "/org/freedesktop/UPower"
 #define UPOWER_INTERFACE "org.freedesktop.UPower"
@@ -85,6 +90,7 @@ typedef struct {
     sd_bus_slot *sensor_properties_slot;
     sd_bus_slot *brightness_properties_slot;
     sd_bus_slot *keyboard_brightness_slot;
+    sd_bus_slot *display_power_properties_slot;
     SabgAmbientModel ambient;
     SabgSmoother smoother;
     SabgTargetHysteresis target_hysteresis;
@@ -106,6 +112,7 @@ typedef struct {
     char keyboard_object_path[PATH_MAX];
     int keyboard_maximum_raw;
     bool keyboard_model_ready;
+    bool display_powered_down;
 } Application;
 
 static uint64_t monotonic_usec(void)
@@ -887,7 +894,7 @@ static int update_keyboard_target(Application *application, double lux, uint64_t
     int target;
     int result;
 
-    if (!application->keyboard_model_ready)
+    if (!application->keyboard_model_ready || application->display_powered_down)
         return 0;
     if (!sabg_keyboard_model_observe(&application->keyboard_model, lux, now_usec, &target))
         return 0;
@@ -948,6 +955,11 @@ static int on_keyboard_brightness(sd_bus_message *message, void *userdata, sd_bu
     )) {
         return 0;
     }
+    if (application->display_powered_down) {
+        if (percentage != 0)
+            return write_keyboard_brightness(application, 0);
+        return 0;
+    }
     if (!application->keyboard_model_ready)
         return 0;
 
@@ -993,6 +1005,7 @@ static bool motion_active(const Application *application)
     return sabg_ambient_model_active(&application->ambient)
         || sabg_trajectory_active(&application->display_trajectory)
         || (application->keyboard_model_ready
+            && !application->display_powered_down
             && (sabg_keyboard_model_active(&application->keyboard_model)
                 || sabg_trajectory_active(&application->keyboard_trajectory)));
 }
@@ -1040,7 +1053,7 @@ static unsigned int motion_update_rate(
         now_usec
     );
 
-    if (application->keyboard_model_ready) {
+    if (application->keyboard_model_ready && !application->display_powered_down) {
         unsigned int keyboard_rate = trajectory_update_rate(
             &application->keyboard_trajectory,
             sabg_keyboard_model_velocity(&application->keyboard_model),
@@ -1101,6 +1114,7 @@ static int update_motion(
     }
 
     if (application->keyboard_model_ready
+        && !application->display_powered_down
         && sabg_keyboard_model_advance(
             &application->keyboard_model,
             lux,
@@ -1279,6 +1293,104 @@ static int on_brightness_properties(sd_bus_message *message, void *userdata, sd_
     return 0;
 }
 
+static int set_display_powered_down(Application *application, bool powered_down)
+{
+    double target = 0.0;
+    uint64_t now_usec;
+    int result;
+
+    if (application->display_powered_down == powered_down)
+        return 0;
+    application->display_powered_down = powered_down;
+    if (!application->keyboard_model_ready)
+        return 0;
+
+    now_usec = monotonic_usec();
+    if (powered_down) {
+        if (application->keyboard_animation_timer != NULL) {
+            result = sd_event_source_set_enabled(
+                application->keyboard_animation_timer,
+                SD_EVENT_OFF
+            );
+            if (result < 0)
+                return result;
+        }
+        if (application->configuration.verbose)
+            fprintf(stderr, "display powered down; keyboard backlight off\n");
+        return write_keyboard_brightness(application, 0);
+    }
+
+    if (application->configuration.verbose)
+        fprintf(stderr, "display powered on; resuming keyboard automation\n");
+    if (application->configuration.legacy_transitions) {
+        sabg_smoother_reset(&application->keyboard_smoother, 0);
+        sabg_target_hysteresis_reset(&application->keyboard_target_hysteresis, 0);
+        return update_keyboard_target(application, application->current_lux, now_usec);
+    }
+
+    sabg_trajectory_reset(&application->keyboard_trajectory, 0.0, now_usec);
+    sabg_output_quantizer_reset(&application->keyboard_quantizer, 0);
+    if (!sabg_keyboard_model_advance(
+        &application->keyboard_model,
+        application->current_lux,
+        now_usec,
+        &target
+    )) {
+        return 0;
+    }
+    sabg_trajectory_set_target(&application->keyboard_trajectory, target, now_usec);
+    if (motion_active(application))
+        return schedule_motion_update(application, now_usec);
+    return 0;
+}
+
+static int on_display_power_properties(
+    sd_bus_message *message,
+    void *userdata,
+    sd_bus_error *error
+)
+{
+    Application *application = userdata;
+    int mode = MUTTER_POWER_SAVE_ON;
+    int result;
+
+    (void)error;
+    result = read_changed_int(
+        message,
+        MUTTER_DISPLAY_INTERFACE,
+        "PowerSaveMode",
+        &mode
+    );
+    if (result <= 0)
+        return result;
+    return set_display_powered_down(application, mode > MUTTER_POWER_SAVE_ON);
+}
+
+static int get_display_powered_down(Application *application, bool *powered_down)
+{
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    int32_t mode = MUTTER_POWER_SAVE_ON;
+    int result;
+
+    result = sd_bus_get_property_trivial(
+        application->session_bus,
+        MUTTER_DISPLAY_DESTINATION,
+        MUTTER_DISPLAY_PATH,
+        MUTTER_DISPLAY_INTERFACE,
+        "PowerSaveMode",
+        &error,
+        'i',
+        &mode
+    );
+    if (result >= 0)
+        *powered_down = mode > MUTTER_POWER_SAVE_ON;
+    else
+        fprintf(stderr, "Unable to read display power state: %s\n",
+            error.message != NULL ? error.message : strerror(-result));
+    sd_bus_error_free(&error);
+    return result;
+}
+
 static int get_initial_state(Application *application, double *lux, int *brightness)
 {
     sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -1413,6 +1525,18 @@ static int application_start(Application *application)
     result = sd_bus_attach_event(application->session_bus, application->event, 0);
     if (result < 0)
         return result;
+    result = sd_bus_match_signal(
+        application->session_bus,
+        &application->display_power_properties_slot,
+        MUTTER_DISPLAY_DESTINATION,
+        MUTTER_DISPLAY_PATH,
+        "org.freedesktop.DBus.Properties",
+        "PropertiesChanged",
+        on_display_power_properties,
+        application
+    );
+    if (result < 0)
+        return result;
 
     if (application->configuration.apple_keepalive) {
         result = sabg_apple_als_keepalive_start(
@@ -1441,6 +1565,8 @@ static int application_start(Application *application)
         fprintf(stderr, "Keyboard backlight unavailable; display control remains active\n");
         application->keyboard_backend = KEYBOARD_BACKEND_NONE;
     }
+    if (get_display_powered_down(application, &application->display_powered_down) < 0)
+        application->display_powered_down = false;
 
     printf("SensorProxy: %.2f lux\n", lux);
     printf("GNOME brightness: %d%%\n", brightness);
@@ -1602,6 +1728,11 @@ static int application_start(Application *application)
             application->configuration.hysteresis_percentage
         );
         application->keyboard_model_ready = true;
+        if (application->display_powered_down) {
+            result = write_keyboard_brightness(application, 0);
+            if (result < 0)
+                return result;
+        }
     }
 
     result = sd_bus_match_signal(
@@ -1668,6 +1799,9 @@ static void application_destroy(Application *application)
     application->sensor_properties_slot = sd_bus_slot_unref(application->sensor_properties_slot);
     application->brightness_properties_slot = sd_bus_slot_unref(application->brightness_properties_slot);
     application->keyboard_brightness_slot = sd_bus_slot_unref(application->keyboard_brightness_slot);
+    application->display_power_properties_slot = sd_bus_slot_unref(
+        application->display_power_properties_slot
+    );
     if (application->system_bus != NULL)
         sd_bus_detach_event(application->system_bus);
     if (application->session_bus != NULL)
