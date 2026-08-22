@@ -1,0 +1,29 @@
+[Unit]
+Description=Smooth GNOME automatic brightness transitions
+Documentation=https://github.com/manbehindthemadness/smooth-autobrightness-for-gnome
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=SABG_OPTIONS=
+ExecStart=smooth-autobrightness-for-gnome $SABG_OPTIONS
+Restart=on-failure
+RestartSec=2
+Nice=10
+CPUWeight=10
+IOWeight=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=graphical-session.target
