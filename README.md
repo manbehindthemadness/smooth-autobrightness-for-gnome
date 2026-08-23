@@ -22,6 +22,7 @@ control a display.
 - `org.gnome.SettingsDaemon.Power.Screen` on the session D-Bus for brightness
 - `org.gnome.SettingsDaemon.Power.Keyboard` for keyboard illumination when available
 - `org.freedesktop.UPower.KbdBacklight` as the portable keyboard fallback
+- `org.freedesktop.login1.Manager` for lid and suspend/resume state
 - `sd-event` one-shot timers for transitions and optional sensor keepalives
 
 The keyboard adapter discovers the desktop interface first and then UPower,
@@ -96,7 +97,12 @@ smooth-autobrightness-for-gnome --apple-als-keepalive
 
 It discovers an IIO device named `als` and reads its illuminance attribute every
 500 ms. Systems whose SensorProxy readings update normally should not enable
-this option.
+this option. Each refresh opens the sysfs attribute anew so an IIO reprobe or
+suspend/resume cycle cannot leave the daemon using a stale descriptor. If the
+device is temporarily unavailable, the adapter rediscovers it and retries;
+repeated diagnostics are limited to one per minute until it recovers.
+The timer allows a small wakeup-coalescing window and is disabled while the lid
+is closed or the system is preparing to sleep.
 
 Enable it for the installed user service with a drop-in:
 
@@ -136,6 +142,8 @@ systemctl --user restart smooth-autobrightness-for-gnome.service
 - Manual keyboard off: suspend keyboard automation until manually raised above zero
 - Automatic keyboard zero: remain active and brighten again when the room darkens
 - Display power-down: turn keyboard illumination off, then resume its ambient target on wake
+- Lid/suspend guard: restore the last manually selected display and keyboard levels, reject
+  covered-sensor readings, and wait two seconds before accepting a fresh ambient sample
 
 Short trajectory corrections retain the natural 40 ms-per-point timing.
 Larger corrections are compressed to 250 ms. Retargeting preserves velocity,
@@ -143,6 +151,16 @@ and output is quantized to actual integer brightness changes. The scheduler
 runs near-stationary, multi-minute drift at 2 Hz, scales through intermediate
 rates for gradual motion, and reaches 60 Hz only for rapid changes or deadline
 pressure.
+
+Closing a laptop lid makes its ambient sensor report darkness before suspend.
+The daemon pauses ambient control as soon as logind reports the lid closed (and
+also on non-lid suspend), restores the last manually selected display and
+keyboard levels on wake, and reapplies them once after GNOME's own wake handling.
+It then gives the sensor two seconds to settle. Resuming resets filter timing
+but does not change the user's calibrated ambient-response curve. Manual choices
+are persisted only when they change, under the service's private XDG state
+directory, so daemon restarts do not turn an automatic level into the new resume
+baseline.
 
 The transition cap, natural step rates, ambient filter, hysteresis, and
 automatic range are configurable from the command line; see `--help`. Set

@@ -1,5 +1,54 @@
 # Development notes
 
+## 2026-08-23 release-candidate cleanup
+
+Successful startup diagnostics are now limited to `--verbose` and `--check`;
+the user service discards stdout and rate-limits journal input. The Apple ALS
+timer allows a 10% wakeup-coalescing window, schedules its next refresh from the
+actual callback time to avoid catch-up bursts, and stops completely while the
+lid/suspend guard is active. Static analysis also prompted removal of an
+unbounded path copy and two ambiguous profile-parser expressions. Release-mode
+operation still enables no diagnostic option; the machine-specific service uses
+only `--apple-als-keepalive`. Last manual display and keyboard choices are stored
+atomically in the service's private state directory only when the user changes
+them; this prevents a daemon restart at an automatic level from changing the
+next resume baseline without adding idle I/O.
+
+### 24-hour burn-in baseline
+
+The release candidate burn-in began at `2026-08-23T10:32:59-06:00`. Installed
+binary SHA-256:
+`58998124f852fc451a5adb2696a3d453fcac5ed90a11e452b2c2f370bc1ca2f6`.
+The clean-start baseline was PID 46078, zero restarts, one task, 528,384 bytes
+current cgroup memory, 1,347,584 bytes peak memory, and 15,144,000 ns CPU time.
+The persisted manual levels were display 79% and keyboard 100%; their state
+file timestamp was 1787502607, which should remain unchanged without a manual
+adjustment. `sabg-24h-burnin-report.timer` is scheduled for
+`2026-08-24 10:32:59 MDT` to capture the final service counters. Release readiness
+requires zero restarts, no new daemon errors, stable memory, successful
+lid/suspend cycles, and no unexpected state-file writes.
+
+## 2026-08-23 lid/suspend brightness guard
+
+The daemon now follows logind's `LidClosed` property and `PrepareForSleep`
+signal. Entering either state freezes display automation before a covered Apple
+ALS reading can drive the panel to its minimum. On the final lid-open/resume
+transition it restores the last manually selected display and keyboard levels,
+reapplies them after GNOME's wake handling, ignores sensor samples for two
+seconds, and resumes from the first settled reading without altering the
+calibrated normalization. The state machine has regression coverage for
+overlapping lid and suspend events, the settling interval, and menu-initiated
+suspend.
+
+## 2026-08-23 Apple ALS keepalive burn-in follow-up
+
+Burn-in exposed a stale IIO descriptor after the Apple ALS device was reprobed.
+The brightness controller continued running, but its optional 500 ms keepalive
+logged `ENODEV` twice per second. The keepalive now opens the sysfs attribute for
+each refresh, rediscovers an automatically selected path after failures, reports
+continued failures at most once per minute, and reports recovery. An event-loop
+regression test removes and recreates a sensor file to cover automatic recovery.
+
 ## 2026-08-22 calibrated v0.5.0 baseline
 
 The approved implementation is on branch `adaptive-motion`. The calibrated

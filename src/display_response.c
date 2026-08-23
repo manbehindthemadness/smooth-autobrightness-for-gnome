@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAXIMUM_PROFILE_BYTES (1024U * 1024U)
+#define MAXIMUM_PROFILE_BYTES (1024L * 1024L)
 
 static double clamp(double value, double minimum, double maximum)
 {
@@ -45,7 +45,7 @@ int sabg_display_response_load(SabgDisplayResponse *response, const char *path)
     if (fseek(stream, 0, SEEK_END) < 0)
         goto out;
     length = ftell(stream);
-    if (length <= 0 || (unsigned long)length > MAXIMUM_PROFILE_BYTES)
+    if (length <= 0 || length > MAXIMUM_PROFILE_BYTES)
         goto out;
     if (fseek(stream, 0, SEEK_SET) < 0)
         goto out;
@@ -60,7 +60,10 @@ int sabg_display_response_load(SabgDisplayResponse *response, const char *path)
     }
     contents[length] = '\0';
     cursor = strstr(contents, key);
-    if (cursor == NULL || (cursor = strchr(cursor + sizeof(key) - 1U, '[')) == NULL)
+    if (cursor == NULL)
+        goto out;
+    cursor = strchr(cursor + sizeof(key) - 1U, '[');
+    if (cursor == NULL)
         goto out;
     cursor++;
 

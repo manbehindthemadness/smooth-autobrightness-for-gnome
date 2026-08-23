@@ -20,8 +20,10 @@ add_library(sabg_core STATIC
   src/keyboard_model.c
   src/output_quantizer.c
   src/smoother.c
+  src/suspend_guard.c
   src/target_hysteresis.c
   src/trajectory.c
+  src/user_brightness.c
   src/write_tracker.c
 )
 target_include_directories(sabg_core PUBLIC include)
@@ -92,9 +94,32 @@ if(BUILD_TESTING)
   target_link_libraries(test-frame-scheduler PRIVATE sabg_core)
   add_test(NAME frame-scheduler COMMAND test-frame-scheduler)
 
+  add_executable(test-suspend-guard tests/test_suspend_guard.c)
+  target_link_libraries(test-suspend-guard PRIVATE sabg_core)
+  add_test(NAME suspend-guard COMMAND test-suspend-guard)
+
+  add_executable(test-user-brightness tests/test_user_brightness.c)
+  target_link_libraries(test-user-brightness PRIVATE sabg_core)
+  add_test(NAME user-brightness COMMAND test-user-brightness)
+
   add_executable(test-display-response tests/test_display_response.c)
   target_link_libraries(test-display-response PRIVATE sabg_core)
   add_test(NAME display-response COMMAND test-display-response)
+
+  add_executable(test-apple-als-keepalive
+    src/apple_als_keepalive.c
+    tests/test_apple_als_keepalive.c
+  )
+  target_include_directories(test-apple-als-keepalive PRIVATE src)
+  target_compile_features(test-apple-als-keepalive PRIVATE c_std_17)
+  target_compile_definitions(test-apple-als-keepalive PRIVATE
+    _POSIX_C_SOURCE=200809L
+  )
+  target_compile_options(test-apple-als-keepalive PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+  )
+  target_link_libraries(test-apple-als-keepalive PRIVATE PkgConfig::SYSTEMD)
+  add_test(NAME apple-als-keepalive COMMAND test-apple-als-keepalive)
 
   add_test(
     NAME calibration-core

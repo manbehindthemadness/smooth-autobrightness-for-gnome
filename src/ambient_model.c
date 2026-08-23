@@ -233,3 +233,24 @@ void sabg_ambient_model_recalibrate(
     model->last_update_usec = now_usec;
     model->large_change_active = false;
 }
+
+void sabg_ambient_model_resume(
+    SabgAmbientModel *model,
+    double lux,
+    int current_percentage,
+    uint64_t now_usec
+)
+{
+    assert(model != NULL);
+    assert(model->initialized);
+
+    model->filtered_percentage = clamp_double(
+        (double)current_percentage,
+        (double)model->minimum_percentage,
+        (double)model->maximum_percentage
+    );
+    model->filtered_velocity = 0.0;
+    model->last_lux = lux;
+    model->last_update_usec = now_usec;
+    model->large_change_active = false;
+}

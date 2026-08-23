@@ -6,8 +6,10 @@
 #include "sabg/keyboard_model.h"
 #include "sabg/output_quantizer.h"
 #include "sabg/smoother.h"
+#include "sabg/suspend_guard.h"
 #include "sabg/target_hysteresis.h"
 #include "sabg/trajectory.h"
+#include "sabg/user_brightness.h"
 #include "sabg/write_tracker.h"
 
 #include <errno.h>
@@ -43,6 +45,11 @@
 #define UPOWER_INTERFACE "org.freedesktop.UPower"
 #define UPOWER_KEYBOARD_PATH "/org/freedesktop/UPower/KbdBacklight"
 #define UPOWER_KEYBOARD_INTERFACE "org.freedesktop.UPower.KbdBacklight"
+#define LOGIND_DESTINATION "org.freedesktop.login1"
+#define LOGIND_PATH "/org/freedesktop/login1"
+#define LOGIND_INTERFACE "org.freedesktop.login1.Manager"
+#define RESUME_RESTORE_DELAY_USEC UINT64_C(1000000)
+#define RESUME_SENSOR_SETTLE_USEC UINT64_C(2000000)
 #define MOTION_MINIMUM_UPDATE_HZ 2U
 #define MOTION_MAXIMUM_UPDATE_HZ 60U
 #define MOTION_MAXIMUM_STEP_PER_FRAME 0.2
@@ -85,12 +92,15 @@ typedef struct {
     sd_event_source *animation_timer;
     sd_event_source *keyboard_animation_timer;
     sd_event_source *motion_timer;
+    sd_event_source *resume_restore_timer;
     sd_bus *system_bus;
     sd_bus *session_bus;
     sd_bus_slot *sensor_properties_slot;
     sd_bus_slot *brightness_properties_slot;
     sd_bus_slot *keyboard_brightness_slot;
     sd_bus_slot *display_power_properties_slot;
+    sd_bus_slot *lid_properties_slot;
+    sd_bus_slot *prepare_for_sleep_slot;
     SabgAmbientModel ambient;
     SabgSmoother smoother;
     SabgTargetHysteresis target_hysteresis;
@@ -105,6 +115,7 @@ typedef struct {
     SabgOutputQuantizer display_quantizer;
     SabgOutputQuantizer keyboard_quantizer;
     SabgAppleAlsKeepalive keepalive;
+    SabgSuspendGuard suspend_guard;
     double current_lux;
     bool light_claimed;
     bool model_ready;
@@ -113,6 +124,9 @@ typedef struct {
     int keyboard_maximum_raw;
     bool keyboard_model_ready;
     bool display_powered_down;
+    int last_user_display_brightness;
+    int last_user_keyboard_brightness;
+    char user_brightness_path[PATH_MAX];
 } Application;
 
 static uint64_t monotonic_usec(void)
@@ -149,6 +163,43 @@ static const char *default_calibration_profile(char path[PATH_MAX])
         );
     }
     return written >= 0 && written < PATH_MAX ? path : NULL;
+}
+
+static bool configure_user_brightness_path(Application *application)
+{
+    const char *state_directory = getenv("STATE_DIRECTORY");
+    int written;
+
+    if (state_directory == NULL || state_directory[0] == '\0')
+        return false;
+    written = snprintf(
+        application->user_brightness_path,
+        sizeof(application->user_brightness_path),
+        "%s/brightness-state",
+        state_directory
+    );
+    return written >= 0
+        && (size_t)written < sizeof(application->user_brightness_path);
+}
+
+static void save_user_brightness(Application *application)
+{
+    SabgUserBrightness brightness = {
+        .display = application->last_user_display_brightness,
+        .keyboard = application->last_user_keyboard_brightness,
+    };
+    int result;
+
+    if (application->user_brightness_path[0] == '\0')
+        return;
+    result = sabg_user_brightness_save(application->user_brightness_path, &brightness);
+    if (result < 0) {
+        fprintf(
+            stderr,
+            "Unable to save user brightness state: %s\n",
+            strerror(-result)
+        );
+    }
 }
 
 static int parse_int(const char *text, int minimum, int maximum, int *value)
@@ -459,6 +510,59 @@ static int read_changed_int(
     return result < 0 ? result : found;
 }
 
+static int read_changed_bool(
+    sd_bus_message *message,
+    const char *expected_interface,
+    const char *property,
+    bool *value
+)
+{
+    const char *interface = NULL;
+    int property_value = 0;
+    int result;
+    int found = 0;
+
+    result = sd_bus_message_read(message, "s", &interface);
+    if (result < 0)
+        return result;
+    if (strcmp(interface, expected_interface) != 0)
+        return 0;
+    result = sd_bus_message_enter_container(message, SD_BUS_TYPE_ARRAY, "{sv}");
+    if (result < 0)
+        return result;
+    while ((result = sd_bus_message_enter_container(message, SD_BUS_TYPE_DICT_ENTRY, "sv")) > 0) {
+        const char *name = NULL;
+
+        result = sd_bus_message_read(message, "s", &name);
+        if (result < 0)
+            return result;
+        if (strcmp(name, property) == 0) {
+            result = sd_bus_message_enter_container(message, SD_BUS_TYPE_VARIANT, "b");
+            if (result < 0)
+                return result;
+            result = sd_bus_message_read(message, "b", &property_value);
+            if (result < 0)
+                return result;
+            result = sd_bus_message_exit_container(message);
+            if (result < 0)
+                return result;
+            *value = property_value != 0;
+            found = 1;
+        } else {
+            result = sd_bus_message_skip(message, "v");
+            if (result < 0)
+                return result;
+        }
+        result = sd_bus_message_exit_container(message);
+        if (result < 0)
+            return result;
+    }
+    if (result < 0)
+        return result;
+    result = sd_bus_message_exit_container(message);
+    return result < 0 ? result : found;
+}
+
 static int schedule_animation(Application *application, uint64_t wakeup_usec);
 
 static int on_brightness_write_reply(
@@ -673,18 +777,25 @@ static int find_upower_keyboard(Application *application, int *percentage)
     if (result >= 0)
         result = sd_bus_message_read(reply, "o", &path);
     if (result > 0 && path != NULL) {
-        if (strlen(path) >= sizeof(application->keyboard_object_path))
+        size_t path_length = strlen(path);
+
+        if (path_length >= sizeof(application->keyboard_object_path))
             result = -ENAMETOOLONG;
         else
-            strcpy(application->keyboard_object_path, path);
+            memcpy(application->keyboard_object_path, path, path_length + 1U);
     } else if (result >= 0) {
         result = -ENODEV;
     }
     reply = sd_bus_message_unref(reply);
     sd_bus_error_free(&error);
 
-    if (result < 0)
-        strcpy(application->keyboard_object_path, UPOWER_KEYBOARD_PATH);
+    if (result < 0) {
+        memcpy(
+            application->keyboard_object_path,
+            UPOWER_KEYBOARD_PATH,
+            sizeof(UPOWER_KEYBOARD_PATH)
+        );
+    }
     result = read_upower_keyboard_state(
         application,
         application->keyboard_object_path,
@@ -963,6 +1074,8 @@ static int on_keyboard_brightness(sd_bus_message *message, void *userdata, sd_bu
     if (!application->keyboard_model_ready)
         return 0;
 
+    application->last_user_keyboard_brightness = percentage;
+    save_user_brightness(application);
     sabg_write_tracker_clear(&application->keyboard_write_tracker);
     sabg_smoother_reset(&application->keyboard_smoother, percentage);
     sabg_target_hysteresis_reset(
@@ -1002,6 +1115,8 @@ static int on_keyboard_brightness(sd_bus_message *message, void *userdata, sd_bu
 
 static bool motion_active(const Application *application)
 {
+    if (sabg_suspend_guard_blocked(&application->suspend_guard))
+        return false;
     return sabg_ambient_model_active(&application->ambient)
         || sabg_trajectory_active(&application->display_trajectory)
         || (application->keyboard_model_ready
@@ -1156,13 +1271,16 @@ static int update_motion(
 static int on_motion_timer(sd_event_source *source, uint64_t usec, void *userdata)
 {
     Application *application = userdata;
+    uint64_t now_usec = monotonic_usec();
 
     (void)source;
     (void)usec;
+    if (sabg_suspend_guard_blocked(&application->suspend_guard))
+        return 0;
     return update_motion(
         application,
         application->current_lux,
-        monotonic_usec(),
+        now_usec,
         false
     );
 }
@@ -1190,11 +1308,174 @@ static int schedule_motion_update(Application *application, uint64_t now_usec)
     return sd_event_source_set_enabled(application->motion_timer, SD_EVENT_ONESHOT);
 }
 
+static int stop_ambient_motion(Application *application, int brightness, uint64_t now_usec)
+{
+    int result;
+
+    if (application->animation_timer != NULL) {
+        result = sd_event_source_set_enabled(application->animation_timer, SD_EVENT_OFF);
+        if (result < 0)
+            return result;
+    }
+    if (application->motion_timer != NULL) {
+        result = sd_event_source_set_enabled(application->motion_timer, SD_EVENT_OFF);
+        if (result < 0)
+            return result;
+    }
+    sabg_smoother_reset(&application->smoother, brightness);
+    sabg_target_hysteresis_reset(&application->target_hysteresis, brightness);
+    sabg_trajectory_reset(
+        &application->display_trajectory,
+        sabg_display_response_to_coordinate(
+            &application->display_response,
+            (double)brightness
+        ),
+        now_usec
+    );
+    sabg_output_quantizer_reset(&application->display_quantizer, brightness);
+    return 0;
+}
+
+static void reset_keyboard_motion(Application *application, int brightness, uint64_t now_usec)
+{
+    if (!application->keyboard_model_ready)
+        return;
+    sabg_smoother_reset(&application->keyboard_smoother, brightness);
+    sabg_target_hysteresis_reset(&application->keyboard_target_hysteresis, brightness);
+    sabg_trajectory_reset(&application->keyboard_trajectory, brightness, now_usec);
+    sabg_output_quantizer_reset(&application->keyboard_quantizer, brightness);
+    if (application->keyboard_animation_timer != NULL)
+        (void)sd_event_source_set_enabled(application->keyboard_animation_timer, SD_EVENT_OFF);
+}
+
+static int restore_user_brightness(Application *application, uint64_t now_usec)
+{
+    int result;
+
+    result = stop_ambient_motion(
+        application,
+        application->last_user_display_brightness,
+        now_usec
+    );
+    if (result < 0)
+        return result;
+    result = write_brightness(application, application->last_user_display_brightness);
+    if (result < 0)
+        return result;
+
+    if (application->keyboard_model_ready) {
+        reset_keyboard_motion(
+            application,
+            application->last_user_keyboard_brightness,
+            now_usec
+        );
+        result = write_keyboard_brightness(
+            application,
+            application->last_user_keyboard_brightness
+        );
+        if (result < 0)
+            return result;
+    }
+    return 0;
+}
+
+static int on_resume_restore_timer(sd_event_source *source, uint64_t usec, void *userdata)
+{
+    Application *application = userdata;
+
+    (void)source;
+    (void)usec;
+    if (application->suspend_guard.lid_closed
+        || application->suspend_guard.preparing_sleep) {
+        return 0;
+    }
+    return restore_user_brightness(application, monotonic_usec());
+}
+
+static int schedule_resume_restore(Application *application, uint64_t now_usec)
+{
+    uint64_t wakeup_usec = now_usec + RESUME_RESTORE_DELAY_USEC;
+    int result;
+
+    if (application->resume_restore_timer == NULL) {
+        return sd_event_add_time(
+            application->event,
+            &application->resume_restore_timer,
+            CLOCK_MONOTONIC,
+            wakeup_usec,
+            UINT64_C(1000),
+            on_resume_restore_timer,
+            application
+        );
+    }
+    result = sd_event_source_set_time(application->resume_restore_timer, wakeup_usec);
+    if (result < 0)
+        return result;
+    return sd_event_source_set_enabled(application->resume_restore_timer, SD_EVENT_ONESHOT);
+}
+
+static int handle_suspend_transition(
+    Application *application,
+    SabgSuspendTransition transition,
+    uint64_t now_usec
+)
+{
+    int result;
+
+    if (transition.entered) {
+        if (application->configuration.apple_keepalive) {
+            result = sabg_apple_als_keepalive_set_enabled(
+                &application->keepalive,
+                false
+            );
+            if (result < 0)
+                return result;
+        }
+        result = stop_ambient_motion(
+            application,
+            application->suspend_guard.protected_brightness,
+            now_usec
+        );
+        if (result < 0)
+            return result;
+        fprintf(
+            stderr,
+            "ambient control paused; preserving display brightness at %d%%\n",
+            application->suspend_guard.protected_brightness
+        );
+    }
+    if (transition.resumed) {
+        if (application->configuration.apple_keepalive) {
+            result = sabg_apple_als_keepalive_set_enabled(
+                &application->keepalive,
+                true
+            );
+            if (result < 0)
+                return result;
+        }
+        result = restore_user_brightness(application, now_usec);
+        if (result < 0)
+            return result;
+        result = schedule_resume_restore(application, now_usec);
+        if (result < 0)
+            return result;
+        fprintf(
+            stderr,
+            "restored user brightness: display %d%%, keyboard %d%%; "
+            "waiting 2 seconds for ambient sensor\n",
+            application->last_user_display_brightness,
+            application->last_user_keyboard_brightness
+        );
+    }
+    return 0;
+}
+
 static int on_sensor_properties(sd_bus_message *message, void *userdata, sd_bus_error *error)
 {
     Application *application = userdata;
     double lux = 0.0;
     uint64_t now_usec;
+    bool first_after_resume = false;
     int target;
     int result;
 
@@ -1205,11 +1486,28 @@ static int on_sensor_properties(sd_bus_message *message, void *userdata, sd_bus_
     if (!isfinite(lux) || lux < 0.0)
         return 0;
 
-    application->current_lux = lux;
     if (!application->model_ready)
         return 0;
 
     now_usec = monotonic_usec();
+    if (!sabg_suspend_guard_accept_sample(
+        &application->suspend_guard,
+        now_usec,
+        &first_after_resume
+    )) {
+        return 0;
+    }
+    application->current_lux = lux;
+    if (first_after_resume) {
+        int brightness = application->suspend_guard.protected_brightness;
+
+        sabg_ambient_model_resume(&application->ambient, lux, brightness, now_usec);
+        result = stop_ambient_motion(application, brightness, now_usec);
+        if (result < 0)
+            return result;
+        if (application->configuration.verbose)
+            fprintf(stderr, "ambient sensor settled at %.2f lux; automation resumed\n", lux);
+    }
     if (!application->configuration.legacy_transitions)
         return update_motion(application, lux, now_usec, true);
     target = sabg_ambient_model_observe(&application->ambient, lux, now_usec);
@@ -1266,6 +1564,11 @@ static int on_brightness_properties(sd_bus_message *message, void *userdata, sd_
     if (!application->model_ready)
         return 0;
 
+    if (sabg_suspend_guard_blocked(&application->suspend_guard))
+        return 0;
+
+    application->last_user_display_brightness = percentage;
+    save_user_brightness(application);
     sabg_write_tracker_clear(&application->write_tracker);
     sabg_smoother_reset(&application->smoother, percentage);
     sabg_target_hysteresis_reset(&application->target_hysteresis, percentage);
@@ -1364,6 +1667,75 @@ static int on_display_power_properties(
     if (result <= 0)
         return result;
     return set_display_powered_down(application, mode > MUTTER_POWER_SAVE_ON);
+}
+
+static int on_lid_properties(sd_bus_message *message, void *userdata, sd_bus_error *error)
+{
+    Application *application = userdata;
+    SabgSuspendTransition transition;
+    bool closed = false;
+    uint64_t now_usec;
+    int result;
+
+    (void)error;
+    result = read_changed_bool(message, LOGIND_INTERFACE, "LidClosed", &closed);
+    if (result <= 0)
+        return result;
+    now_usec = monotonic_usec();
+    transition = sabg_suspend_guard_set_lid(
+        &application->suspend_guard,
+        closed,
+        application->last_user_display_brightness,
+        now_usec
+    );
+    return handle_suspend_transition(application, transition, now_usec);
+}
+
+static int on_prepare_for_sleep(sd_bus_message *message, void *userdata, sd_bus_error *error)
+{
+    Application *application = userdata;
+    SabgSuspendTransition transition;
+    int preparing = 0;
+    uint64_t now_usec;
+    int result;
+
+    (void)error;
+    result = sd_bus_message_read(message, "b", &preparing);
+    if (result < 0)
+        return result;
+    now_usec = monotonic_usec();
+    transition = sabg_suspend_guard_set_sleep(
+        &application->suspend_guard,
+        preparing != 0,
+        application->last_user_display_brightness,
+        now_usec
+    );
+    return handle_suspend_transition(application, transition, now_usec);
+}
+
+static int get_lid_closed(Application *application, bool *closed)
+{
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    int value = 0;
+    int result;
+
+    result = sd_bus_get_property_trivial(
+        application->system_bus,
+        LOGIND_DESTINATION,
+        LOGIND_PATH,
+        LOGIND_INTERFACE,
+        "LidClosed",
+        &error,
+        'b',
+        &value
+    );
+    if (result >= 0)
+        *closed = value != 0;
+    else
+        fprintf(stderr, "Unable to read lid state: %s\n",
+            error.message != NULL ? error.message : strerror(-result));
+    sd_bus_error_free(&error);
+    return result;
 }
 
 static int get_display_powered_down(Application *application, bool *powered_down)
@@ -1507,6 +1879,8 @@ static int application_start(Application *application)
     double lux = 0.0;
     int brightness = 0;
     int keyboard_brightness = 0;
+    bool lid_closed = false;
+    SabgUserBrightness saved_brightness;
     uint64_t now_usec;
     int result;
 
@@ -1549,9 +1923,11 @@ static int application_start(Application *application)
             fprintf(stderr, "Unable to start Apple ALS keepalive: %s\n", strerror(-result));
             return result;
         }
-        fprintf(stderr, "Apple ALS keepalive: %s every %u ms\n",
-            application->keepalive.path,
-            application->configuration.apple_refresh_ms);
+        if (application->configuration.verbose) {
+            fprintf(stderr, "Apple ALS keepalive: %s every %u ms\n",
+                application->keepalive.path,
+                application->configuration.apple_refresh_ms);
+        }
     }
 
     result = claim_light_sensor(application);
@@ -1560,24 +1936,48 @@ static int application_start(Application *application)
     result = get_initial_state(application, &lux, &brightness);
     if (result < 0)
         return result;
+    if (get_lid_closed(application, &lid_closed) < 0)
+        lid_closed = false;
     result = discover_keyboard_backlight(application, &keyboard_brightness);
     if (result < 0 && result != -EOPNOTSUPP) {
         fprintf(stderr, "Keyboard backlight unavailable; display control remains active\n");
         application->keyboard_backend = KEYBOARD_BACKEND_NONE;
     }
+    application->last_user_display_brightness = brightness;
+    application->last_user_keyboard_brightness = keyboard_brightness;
+    if (configure_user_brightness_path(application)) {
+        result = sabg_user_brightness_load(
+            application->user_brightness_path,
+            &saved_brightness
+        );
+        if (result == 0) {
+            application->last_user_display_brightness = saved_brightness.display;
+            application->last_user_keyboard_brightness = saved_brightness.keyboard;
+        } else if (result == -ENOENT) {
+            save_user_brightness(application);
+        } else {
+            fprintf(
+                stderr,
+                "Ignoring invalid user brightness state: %s\n",
+                strerror(-result)
+            );
+        }
+    }
     if (get_display_powered_down(application, &application->display_powered_down) < 0)
         application->display_powered_down = false;
 
-    printf("SensorProxy: %.2f lux\n", lux);
-    printf("GNOME brightness: %d%%\n", brightness);
-    if (application->keyboard_backend != KEYBOARD_BACKEND_NONE) {
-        printf(
-            "Keyboard brightness: %d%% via %s\n",
-            keyboard_brightness,
-            keyboard_backend_name(application)
-        );
-    } else {
-        printf("Keyboard brightness: unavailable\n");
+    if (application->configuration.check_only || application->configuration.verbose) {
+        printf("SensorProxy: %.2f lux\n", lux);
+        printf("GNOME brightness: %d%%\n", brightness);
+        if (application->keyboard_backend != KEYBOARD_BACKEND_NONE) {
+            printf(
+                "Keyboard brightness: %d%% via %s\n",
+                keyboard_brightness,
+                keyboard_backend_name(application)
+            );
+        } else {
+            printf("Keyboard brightness: unavailable\n");
+        }
     }
     if (application->configuration.check_only)
         return 1;
@@ -1591,7 +1991,8 @@ static int application_start(Application *application)
         if (profile_path != NULL) {
             result = sabg_display_response_load(&application->display_response, profile_path);
             if (result == 0) {
-                fprintf(stderr, "Display response profile: %s\n", profile_path);
+                if (application->configuration.verbose)
+                    fprintf(stderr, "Display response profile: %s\n", profile_path);
             } else if (result != -ENOENT) {
                 fprintf(
                     stderr,
@@ -1673,6 +2074,20 @@ static int application_start(Application *application)
         application->configuration.maximum_percentage,
         application->configuration.hysteresis_percentage
     );
+    sabg_suspend_guard_init(
+        &application->suspend_guard,
+        lid_closed,
+        brightness,
+        RESUME_SENSOR_SETTLE_USEC
+    );
+    if (lid_closed && application->configuration.apple_keepalive) {
+        result = sabg_apple_als_keepalive_set_enabled(
+            &application->keepalive,
+            false
+        );
+        if (result < 0)
+            return result;
+    }
     application->model_ready = true;
 
     if (application->keyboard_backend != KEYBOARD_BACKEND_NONE) {
@@ -1748,6 +2163,30 @@ static int application_start(Application *application)
     if (result < 0)
         return result;
     result = sd_bus_match_signal(
+        application->system_bus,
+        &application->lid_properties_slot,
+        LOGIND_DESTINATION,
+        LOGIND_PATH,
+        "org.freedesktop.DBus.Properties",
+        "PropertiesChanged",
+        on_lid_properties,
+        application
+    );
+    if (result < 0)
+        return result;
+    result = sd_bus_match_signal(
+        application->system_bus,
+        &application->prepare_for_sleep_slot,
+        LOGIND_DESTINATION,
+        LOGIND_PATH,
+        LOGIND_INTERFACE,
+        "PrepareForSleep",
+        on_prepare_for_sleep,
+        application
+    );
+    if (result < 0)
+        return result;
+    result = sd_bus_match_signal(
         application->session_bus,
         &application->brightness_properties_slot,
         GNOME_POWER_DESTINATION,
@@ -1796,11 +2235,18 @@ static void application_destroy(Application *application)
     application->animation_timer = sd_event_source_unref(application->animation_timer);
     application->keyboard_animation_timer = sd_event_source_unref(application->keyboard_animation_timer);
     application->motion_timer = sd_event_source_unref(application->motion_timer);
+    application->resume_restore_timer = sd_event_source_unref(
+        application->resume_restore_timer
+    );
     application->sensor_properties_slot = sd_bus_slot_unref(application->sensor_properties_slot);
     application->brightness_properties_slot = sd_bus_slot_unref(application->brightness_properties_slot);
     application->keyboard_brightness_slot = sd_bus_slot_unref(application->keyboard_brightness_slot);
     application->display_power_properties_slot = sd_bus_slot_unref(
         application->display_power_properties_slot
+    );
+    application->lid_properties_slot = sd_bus_slot_unref(application->lid_properties_slot);
+    application->prepare_for_sleep_slot = sd_bus_slot_unref(
+        application->prepare_for_sleep_slot
     );
     if (application->system_bus != NULL)
         sd_bus_detach_event(application->system_bus);
@@ -1817,7 +2263,6 @@ int main(int argc, char **argv)
     sigset_t signal_mask;
     int result;
 
-    application.keepalive.fd = -1;
     result = parse_arguments(argc, argv, &application.configuration);
     if (result < 0) {
         print_usage(stderr, argv[0]);
@@ -1846,7 +2291,8 @@ int main(int argc, char **argv)
     if (result >= 0)
         result = sd_event_add_signal(application.event, NULL, SIGTERM, on_exit_signal, application.event);
     if (result >= 0) {
-        fprintf(stderr, "smooth ambient brightness active\n");
+        if (application.configuration.verbose)
+            fprintf(stderr, "smooth ambient brightness active\n");
         result = sd_event_loop(application.event);
     }
 

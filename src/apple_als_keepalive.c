@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #define IIO_ROOT "/sys/bus/iio/devices"
+#define ERROR_LOG_INTERVAL_USEC (UINT64_C(60) * UINT64_C(1000000))
 
 static int read_text_file(const char *path, char *buffer, size_t size)
 {
@@ -90,27 +91,74 @@ static int discover_apple_als(char *result, size_t result_size)
     return found;
 }
 
-static int refresh_sensor(SabgAppleAlsKeepalive *keepalive)
+static int read_sensor(const char *path)
 {
     char buffer[64];
+    int fd;
     ssize_t count;
 
-    count = pread(keepalive->fd, buffer, sizeof(buffer), 0);
-    if (count < 0)
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
         return -errno;
+
+    count = read(fd, buffer, sizeof(buffer));
+    if (count < 0) {
+        int saved_errno = errno;
+        close(fd);
+        return -saved_errno;
+    }
+
+    close(fd);
     return 0;
+}
+
+static int refresh_sensor(SabgAppleAlsKeepalive *keepalive)
+{
+    char discovered_path[sizeof(keepalive->path)];
+    int result;
+
+    result = read_sensor(keepalive->path);
+    if (result >= 0 || keepalive->explicit_path)
+        return result;
+
+    if (discover_apple_als(discovered_path, sizeof(discovered_path)) < 0)
+        return result;
+
+    memcpy(keepalive->path, discovered_path, strlen(discovered_path) + 1U);
+    return read_sensor(keepalive->path);
 }
 
 static int on_keepalive_timer(sd_event_source *source, uint64_t usec, void *userdata)
 {
     SabgAppleAlsKeepalive *keepalive = userdata;
+    sd_event *event = sd_event_source_get_event(source);
+    uint64_t now = usec;
     int result;
 
-    result = refresh_sensor(keepalive);
+    result = sd_event_now(event, CLOCK_MONOTONIC, &now);
     if (result < 0)
-        fprintf(stderr, "Apple ALS keepalive read failed: %s\n", strerror(-result));
+        return result;
 
-    result = sd_event_source_set_time(source, usec + keepalive->interval_usec);
+    result = refresh_sensor(keepalive);
+    if (result < 0) {
+        keepalive->failure_count++;
+        if (keepalive->next_error_log_usec == 0 || now >= keepalive->next_error_log_usec) {
+            fprintf(stderr,
+                "Apple ALS keepalive read failed: %s; will retry\n",
+                strerror(-result));
+            keepalive->next_error_log_usec = now + ERROR_LOG_INTERVAL_USEC;
+        }
+    } else if (keepalive->failure_count > 0) {
+        fprintf(stderr,
+            "Apple ALS keepalive recovered after %llu failed refresh%s: %s\n",
+            (unsigned long long)keepalive->failure_count,
+            keepalive->failure_count == 1 ? "" : "es",
+            keepalive->path);
+        keepalive->failure_count = 0;
+        keepalive->next_error_log_usec = 0;
+    }
+
+    result = sd_event_source_set_time(source, now + keepalive->interval_usec);
     if (result < 0)
         return result;
     return sd_event_source_set_enabled(source, SD_EVENT_ONESHOT);
@@ -130,7 +178,6 @@ int sabg_apple_als_keepalive_start(
         return -EINVAL;
 
     memset(keepalive, 0, sizeof(*keepalive));
-    keepalive->fd = -1;
     keepalive->interval_usec = (uint64_t)interval_ms * UINT64_C(1000);
     if (keepalive->interval_usec == 0)
         return -EINVAL;
@@ -140,15 +187,12 @@ int sabg_apple_als_keepalive_start(
         if (length >= sizeof(keepalive->path))
             return -ENAMETOOLONG;
         memcpy(keepalive->path, requested_path, length + 1U);
+        keepalive->explicit_path = true;
     } else {
         result = discover_apple_als(keepalive->path, sizeof(keepalive->path));
         if (result < 0)
             return result;
     }
-
-    keepalive->fd = open(keepalive->path, O_RDONLY | O_CLOEXEC);
-    if (keepalive->fd < 0)
-        return -errno;
 
     result = refresh_sensor(keepalive);
     if (result < 0)
@@ -163,7 +207,7 @@ int sabg_apple_als_keepalive_start(
         &keepalive->timer,
         CLOCK_MONOTONIC,
         now + keepalive->interval_usec,
-        0,
+        keepalive->interval_usec / UINT64_C(10),
         on_keepalive_timer,
         keepalive
     );
@@ -177,13 +221,37 @@ fail:
     return result;
 }
 
+int sabg_apple_als_keepalive_set_enabled(
+    SabgAppleAlsKeepalive *keepalive,
+    bool enabled
+)
+{
+    sd_event *event;
+    uint64_t now;
+    int result;
+
+    if (keepalive == NULL || keepalive->timer == NULL)
+        return -EINVAL;
+    if (!enabled)
+        return sd_event_source_set_enabled(keepalive->timer, SD_EVENT_OFF);
+
+    event = sd_event_source_get_event(keepalive->timer);
+    result = sd_event_now(event, CLOCK_MONOTONIC, &now);
+    if (result < 0)
+        return result;
+    result = sd_event_source_set_time(
+        keepalive->timer,
+        now + keepalive->interval_usec
+    );
+    if (result < 0)
+        return result;
+    return sd_event_source_set_enabled(keepalive->timer, SD_EVENT_ONESHOT);
+}
+
 void sabg_apple_als_keepalive_destroy(SabgAppleAlsKeepalive *keepalive)
 {
     if (keepalive == NULL)
         return;
 
     keepalive->timer = sd_event_source_unref(keepalive->timer);
-    if (keepalive->fd >= 0)
-        close(keepalive->fd);
-    keepalive->fd = -1;
 }

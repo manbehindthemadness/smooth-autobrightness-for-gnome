@@ -77,5 +77,16 @@ int main(void)
     sabg_ambient_model_recalibrate(&model, 100.0, 50, UINT64_C(1100000));
     assert(sabg_ambient_model_velocity(&model) == 0.0);
 
+    {
+        double normalization = model.normalization_lux;
+        sabg_ambient_model_resume(&model, 300.0, 42, UINT64_C(9000000));
+        assert(model.normalization_lux == normalization);
+        assert(model.filtered_percentage == 42.0);
+        assert(model.last_lux == 300.0);
+        assert(model.last_update_usec == UINT64_C(9000000));
+        assert(model.filtered_velocity == 0.0);
+        assert(!model.large_change_active);
+    }
+
     return 0;
 }

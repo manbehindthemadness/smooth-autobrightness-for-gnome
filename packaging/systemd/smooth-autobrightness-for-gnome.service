@@ -10,6 +10,12 @@ Environment=SABG_OPTIONS=
 ExecStart=/usr/local/bin/smooth-autobrightness-for-gnome $SABG_OPTIONS
 Restart=on-failure
 RestartSec=2
+StandardOutput=null
+StandardError=journal
+LogRateLimitIntervalSec=60s
+LogRateLimitBurst=20
+StateDirectory=smooth-autobrightness-for-gnome-state
+StateDirectoryMode=0700
 Nice=0
 CPUWeight=200
 CPUQuota=5%
@@ -28,6 +34,7 @@ RestrictAddressFamilies=AF_UNIX
 RestrictRealtime=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
+UMask=0077
 
 [Install]
 WantedBy=graphical-session.target

@@ -75,3 +75,10 @@ void sabg_ambient_model_recalibrate(
     int manual_percentage,
     uint64_t now_usec
 );
+
+void sabg_ambient_model_resume(
+    SabgAmbientModel *model,
+    double lux,
+    int current_percentage,
+    uint64_t now_usec
+);
