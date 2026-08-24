@@ -104,6 +104,13 @@ repeated diagnostics are limited to one per minute until it recovers.
 The timer allows a small wakeup-coalescing window and is disabled while the lid
 is closed or the system is preparing to sleep.
 
+The daemon also watches the SensorProxy D-Bus name. If SensorProxy exits during
+an IIO reprobe, suspend, hibernation, hotplug, or an independent service restart,
+the old light claim is discarded. When a replacement owner appears, the daemon
+reclaims the sensor and explicitly refreshes its light level after the existing
+settle window. Recovery uses bounded retries and does not depend on a particular
+sleep implementation or system-level workaround.
+
 Enable it for the installed user service with a drop-in:
 
 ```bash

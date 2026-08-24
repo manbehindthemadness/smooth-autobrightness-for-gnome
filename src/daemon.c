@@ -30,6 +30,10 @@
 #define SENSOR_PATH "/net/hadess/SensorProxy"
 #define SENSOR_INTERFACE "net.hadess.SensorProxy"
 
+#define DBUS_DESTINATION "org.freedesktop.DBus"
+#define DBUS_PATH "/org/freedesktop/DBus"
+#define DBUS_INTERFACE "org.freedesktop.DBus"
+
 #define GNOME_POWER_DESTINATION "org.gnome.SettingsDaemon.Power"
 #define GNOME_POWER_PATH "/org/gnome/SettingsDaemon/Power"
 #define GNOME_SCREEN_INTERFACE "org.gnome.SettingsDaemon.Power.Screen"
@@ -50,6 +54,9 @@
 #define LOGIND_INTERFACE "org.freedesktop.login1.Manager"
 #define RESUME_RESTORE_DELAY_USEC UINT64_C(1000000)
 #define RESUME_SENSOR_SETTLE_USEC UINT64_C(2000000)
+#define SENSOR_OWNER_SETTLE_USEC UINT64_C(250000)
+#define SENSOR_REFRESH_RETRY_USEC UINT64_C(500000)
+#define SENSOR_REFRESH_MAX_ATTEMPTS 10U
 #define MOTION_MINIMUM_UPDATE_HZ 2U
 #define MOTION_MAXIMUM_UPDATE_HZ 60U
 #define MOTION_MAXIMUM_STEP_PER_FRAME 0.2
@@ -93,9 +100,11 @@ typedef struct {
     sd_event_source *keyboard_animation_timer;
     sd_event_source *motion_timer;
     sd_event_source *resume_restore_timer;
+    sd_event_source *sensor_refresh_timer;
     sd_bus *system_bus;
     sd_bus *session_bus;
     sd_bus_slot *sensor_properties_slot;
+    sd_bus_slot *sensor_owner_slot;
     sd_bus_slot *brightness_properties_slot;
     sd_bus_slot *keyboard_brightness_slot;
     sd_bus_slot *display_power_properties_slot;
@@ -118,6 +127,7 @@ typedef struct {
     SabgSuspendGuard suspend_guard;
     double current_lux;
     bool light_claimed;
+    unsigned int sensor_refresh_attempts;
     bool model_ready;
     KeyboardBackend keyboard_backend;
     char keyboard_object_path[PATH_MAX];
@@ -128,6 +138,8 @@ typedef struct {
     int last_user_keyboard_brightness;
     char user_brightness_path[PATH_MAX];
 } Application;
+
+static int schedule_sensor_refresh(Application *application, uint64_t wakeup_usec);
 
 static uint64_t monotonic_usec(void)
 {
@@ -1459,6 +1471,12 @@ static int handle_suspend_transition(
         result = schedule_resume_restore(application, now_usec);
         if (result < 0)
             return result;
+        result = schedule_sensor_refresh(
+            application,
+            application->suspend_guard.resume_after_usec
+        );
+        if (result < 0)
+            return result;
         fprintf(
             stderr,
             "restored user brightness: display %d%%, keyboard %d%%; "
@@ -1470,19 +1488,13 @@ static int handle_suspend_transition(
     return 0;
 }
 
-static int on_sensor_properties(sd_bus_message *message, void *userdata, sd_bus_error *error)
+static int handle_sensor_sample(Application *application, double lux)
 {
-    Application *application = userdata;
-    double lux = 0.0;
     uint64_t now_usec;
     bool first_after_resume = false;
     int target;
     int result;
 
-    (void)error;
-    result = read_changed_double(message, SENSOR_INTERFACE, "LightLevel", &lux);
-    if (result <= 0)
-        return result;
     if (!isfinite(lux) || lux < 0.0)
         return 0;
 
@@ -1540,6 +1552,19 @@ static int on_sensor_properties(sd_bus_message *message, void *userdata, sd_bus_
         }
     }
     return update_keyboard_target(application, lux, now_usec);
+}
+
+static int on_sensor_properties(sd_bus_message *message, void *userdata, sd_bus_error *error)
+{
+    Application *application = userdata;
+    double lux = 0.0;
+    int result;
+
+    (void)error;
+    result = read_changed_double(message, SENSOR_INTERFACE, "LightLevel", &lux);
+    if (result <= 0)
+        return result;
+    return handle_sensor_sample(application, lux);
 }
 
 static int on_brightness_properties(sd_bus_message *message, void *userdata, sd_bus_error *error)
@@ -1763,11 +1788,10 @@ static int get_display_powered_down(Application *application, bool *powered_down
     return result;
 }
 
-static int get_initial_state(Application *application, double *lux, int *brightness)
+static int get_light_level(Application *application, double *lux)
 {
     sd_bus_error error = SD_BUS_ERROR_NULL;
     int has_ambient = 0;
-    int32_t brightness_value = 0;
     int result;
 
     result = sd_bus_get_property_trivial(
@@ -1786,7 +1810,6 @@ static int get_initial_state(Application *application, double *lux, int *brightn
         result = -ENODEV;
         goto out;
     }
-
     result = sd_bus_get_property_trivial(
         application->system_bus,
         SENSOR_DESTINATION,
@@ -1797,6 +1820,19 @@ static int get_initial_state(Application *application, double *lux, int *brightn
         'd',
         lux
     );
+
+out:
+    sd_bus_error_free(&error);
+    return result;
+}
+
+static int get_initial_state(Application *application, double *lux, int *brightness)
+{
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    int32_t brightness_value = 0;
+    int result;
+
+    result = get_light_level(application, lux);
     if (result < 0)
         goto out;
 
@@ -1842,6 +1878,112 @@ static int claim_light_sensor(Application *application)
         fprintf(stderr, "Unable to claim ambient sensor: %s\n",
             error.message != NULL ? error.message : strerror(-result));
     sd_bus_error_free(&error);
+    return result;
+}
+
+static int on_sensor_refresh_timer(sd_event_source *source, uint64_t usec, void *userdata)
+{
+    Application *application = userdata;
+    sd_event *event = sd_event_source_get_event(source);
+    double lux = 0.0;
+    uint64_t now_usec = usec;
+    int result;
+
+    if (!application->light_claimed) {
+        result = claim_light_sensor(application);
+        if (result < 0)
+            goto retry;
+    }
+    result = get_light_level(application, &lux);
+    if (result < 0)
+        goto retry;
+
+    application->sensor_refresh_attempts = 0;
+    return handle_sensor_sample(application, lux);
+
+retry:
+    application->sensor_refresh_attempts++;
+    if (application->sensor_refresh_attempts >= SENSOR_REFRESH_MAX_ATTEMPTS) {
+        fprintf(
+            stderr,
+            "ambient sensor did not recover after %u refresh attempts\n",
+            application->sensor_refresh_attempts
+        );
+        application->sensor_refresh_attempts = 0;
+        return 0;
+    }
+    result = sd_event_now(event, CLOCK_MONOTONIC, &now_usec);
+    if (result < 0)
+        return result;
+    result = sd_event_source_set_time(
+        source,
+        now_usec + SENSOR_REFRESH_RETRY_USEC
+    );
+    if (result < 0)
+        return result;
+    return sd_event_source_set_enabled(source, SD_EVENT_ONESHOT);
+}
+
+static int schedule_sensor_refresh(Application *application, uint64_t wakeup_usec)
+{
+    int result;
+
+    application->sensor_refresh_attempts = 0;
+    if (application->sensor_refresh_timer == NULL) {
+        return sd_event_add_time(
+            application->event,
+            &application->sensor_refresh_timer,
+            CLOCK_MONOTONIC,
+            wakeup_usec,
+            UINT64_C(1000),
+            on_sensor_refresh_timer,
+            application
+        );
+    }
+    result = sd_event_source_set_time(application->sensor_refresh_timer, wakeup_usec);
+    if (result < 0)
+        return result;
+    return sd_event_source_set_enabled(
+        application->sensor_refresh_timer,
+        SD_EVENT_ONESHOT
+    );
+}
+
+static int on_sensor_owner_changed(
+    sd_bus_message *message,
+    void *userdata,
+    sd_bus_error *error
+)
+{
+    Application *application = userdata;
+    const char *name = NULL;
+    const char *old_owner = NULL;
+    const char *new_owner = NULL;
+    uint64_t wakeup_usec;
+    int result;
+
+    (void)error;
+    result = sd_bus_message_read(message, "sss", &name, &old_owner, &new_owner);
+    if (result < 0)
+        return result;
+    if (strcmp(name, SENSOR_DESTINATION) != 0)
+        return 0;
+
+    if (old_owner[0] != '\0') {
+        application->light_claimed = false;
+        fprintf(stderr, "ambient sensor proxy disappeared; waiting for replacement\n");
+    }
+    if (new_owner[0] == '\0' || application->light_claimed)
+        return 0;
+
+    wakeup_usec = monotonic_usec() + SENSOR_OWNER_SETTLE_USEC;
+    if (application->suspend_guard.resume_sample_pending
+        && wakeup_usec < application->suspend_guard.resume_after_usec) {
+        wakeup_usec = application->suspend_guard.resume_after_usec;
+    }
+    result = schedule_sensor_refresh(application, wakeup_usec);
+    if (result >= 0)
+        fprintf(stderr, "ambient sensor proxy returned; scheduling a fresh claim\n");
     return result;
 }
 
@@ -1897,6 +2039,18 @@ static int application_start(Application *application)
     if (result < 0)
         return result;
     result = sd_bus_attach_event(application->session_bus, application->event, 0);
+    if (result < 0)
+        return result;
+    result = sd_bus_match_signal(
+        application->system_bus,
+        &application->sensor_owner_slot,
+        DBUS_DESTINATION,
+        DBUS_PATH,
+        DBUS_INTERFACE,
+        "NameOwnerChanged",
+        on_sensor_owner_changed,
+        application
+    );
     if (result < 0)
         return result;
     result = sd_bus_match_signal(
@@ -2238,7 +2392,11 @@ static void application_destroy(Application *application)
     application->resume_restore_timer = sd_event_source_unref(
         application->resume_restore_timer
     );
+    application->sensor_refresh_timer = sd_event_source_unref(
+        application->sensor_refresh_timer
+    );
     application->sensor_properties_slot = sd_bus_slot_unref(application->sensor_properties_slot);
+    application->sensor_owner_slot = sd_bus_slot_unref(application->sensor_owner_slot);
     application->brightness_properties_slot = sd_bus_slot_unref(application->brightness_properties_slot);
     application->keyboard_brightness_slot = sd_bus_slot_unref(application->keyboard_brightness_slot);
     application->display_power_properties_slot = sd_bus_slot_unref(
