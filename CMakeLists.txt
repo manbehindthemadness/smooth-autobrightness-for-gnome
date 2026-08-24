@@ -18,6 +18,7 @@ add_library(sabg_core STATIC
   src/display_response.c
   src/frame_scheduler.c
   src/keyboard_model.c
+  src/lux_average.c
   src/output_quantizer.c
   src/smoother.c
   src/suspend_guard.c
@@ -77,6 +78,10 @@ if(BUILD_TESTING)
   add_executable(test-keyboard-model tests/test_keyboard_model.c)
   target_link_libraries(test-keyboard-model PRIVATE sabg_core)
   add_test(NAME keyboard-model COMMAND test-keyboard-model)
+
+  add_executable(test-lux-average tests/test_lux_average.c)
+  target_link_libraries(test-lux-average PRIVATE sabg_core)
+  add_test(NAME lux-average COMMAND test-lux-average)
 
   add_executable(test-target-hysteresis tests/test_target_hysteresis.c)
   target_link_libraries(test-target-hysteresis PRIVATE sabg_core)

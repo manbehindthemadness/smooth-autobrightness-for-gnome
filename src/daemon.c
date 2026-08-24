@@ -4,6 +4,7 @@
 #include "sabg/display_response.h"
 #include "sabg/frame_scheduler.h"
 #include "sabg/keyboard_model.h"
+#include "sabg/lux_average.h"
 #include "sabg/output_quantizer.h"
 #include "sabg/smoother.h"
 #include "sabg/suspend_guard.h"
@@ -57,6 +58,7 @@
 #define SENSOR_OWNER_SETTLE_USEC UINT64_C(250000)
 #define SENSOR_REFRESH_RETRY_USEC UINT64_C(500000)
 #define SENSOR_REFRESH_MAX_ATTEMPTS 10U
+#define SENSOR_SAMPLE_INTERVAL_USEC UINT64_C(500000)
 #define MOTION_MINIMUM_UPDATE_HZ 2U
 #define MOTION_MAXIMUM_UPDATE_HZ 60U
 #define MOTION_MAXIMUM_STEP_PER_FRAME 0.2
@@ -80,6 +82,7 @@ typedef struct {
     unsigned int hysteresis_percentage;
     unsigned int apple_refresh_ms;
     double ambient_time_constant_seconds;
+    double sensor_average_seconds;
     int minimum_percentage;
     int maximum_percentage;
     bool keyboard_backlight;
@@ -101,6 +104,7 @@ typedef struct {
     sd_event_source *motion_timer;
     sd_event_source *resume_restore_timer;
     sd_event_source *sensor_refresh_timer;
+    sd_event_source *sensor_sample_timer;
     sd_bus *system_bus;
     sd_bus *session_bus;
     sd_bus_slot *sensor_properties_slot;
@@ -125,7 +129,10 @@ typedef struct {
     SabgOutputQuantizer keyboard_quantizer;
     SabgAppleAlsKeepalive keepalive;
     SabgSuspendGuard suspend_guard;
+    SabgLuxAverage lux_average;
+    double raw_lux;
     double current_lux;
+    uint64_t sensor_average_until_usec;
     bool light_claimed;
     unsigned int sensor_refresh_attempts;
     bool model_ready;
@@ -140,6 +147,7 @@ typedef struct {
 } Application;
 
 static int schedule_sensor_refresh(Application *application, uint64_t wakeup_usec);
+static int schedule_sensor_sample(Application *application, uint64_t wakeup_usec);
 
 static uint64_t monotonic_usec(void)
 {
@@ -149,6 +157,13 @@ static uint64_t monotonic_usec(void)
         return 0;
     return (uint64_t)now.tv_sec * UINT64_C(1000000)
         + (uint64_t)now.tv_nsec / UINT64_C(1000);
+}
+
+static uint64_t sensor_average_window_usec(const Application *application)
+{
+    return (uint64_t)(
+        application->configuration.sensor_average_seconds * 1000000.0
+    );
 }
 
 static const char *default_calibration_profile(char path[PATH_MAX])
@@ -254,6 +269,7 @@ static void print_usage(FILE *stream, const char *program)
         "  --max-transition-ms N      maximum automatic fade time (default: 250)\n"
         "  --hysteresis N             target change threshold in %% (default: 2)\n"
         "  --ambient-time-constant S  target filter time constant (default: 1.6)\n"
+        "  --sensor-average-seconds S rolling lux window (default: 10.0)\n"
         "  --min-brightness N         automatic floor (default: 2)\n"
         "  --max-brightness N         automatic ceiling (default: 100)\n"
         "  --no-keyboard-backlight    leave keyboard illumination unchanged\n"
@@ -280,6 +296,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
         OPTION_MAX_TRANSITION,
         OPTION_HYSTERESIS,
         OPTION_AMBIENT_TIME_CONSTANT,
+        OPTION_SENSOR_AVERAGE_SECONDS,
         OPTION_MIN_BRIGHTNESS,
         OPTION_MAX_BRIGHTNESS,
         OPTION_NO_KEYBOARD_BACKLIGHT,
@@ -300,6 +317,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
         {"max-transition-ms", required_argument, NULL, OPTION_MAX_TRANSITION},
         {"hysteresis", required_argument, NULL, OPTION_HYSTERESIS},
         {"ambient-time-constant", required_argument, NULL, OPTION_AMBIENT_TIME_CONSTANT},
+        {"sensor-average-seconds", required_argument, NULL, OPTION_SENSOR_AVERAGE_SECONDS},
         {"min-brightness", required_argument, NULL, OPTION_MIN_BRIGHTNESS},
         {"max-brightness", required_argument, NULL, OPTION_MAX_BRIGHTNESS},
         {"no-keyboard-backlight", no_argument, NULL, OPTION_NO_KEYBOARD_BACKLIGHT},
@@ -326,6 +344,7 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
         .hysteresis_percentage = 2,
         .apple_refresh_ms = 500,
         .ambient_time_constant_seconds = 1.6,
+        .sensor_average_seconds = 10.0,
         .minimum_percentage = 2,
         .maximum_percentage = 100,
         .keyboard_backlight = true,
@@ -355,6 +374,10 @@ static int parse_arguments(int argc, char **argv, Configuration *configuration)
             break;
         case OPTION_AMBIENT_TIME_CONSTANT:
             if (parse_double(optarg, 0.01, 300.0, &configuration->ambient_time_constant_seconds) < 0)
+                return -EINVAL;
+            break;
+        case OPTION_SENSOR_AVERAGE_SECONDS:
+            if (parse_double(optarg, 0.25, 30.0, &configuration->sensor_average_seconds) < 0)
                 return -EINVAL;
             break;
         case OPTION_MIN_BRIGHTNESS:
@@ -1435,6 +1458,16 @@ static int handle_suspend_transition(
     int result;
 
     if (transition.entered) {
+        sabg_lux_average_clear(&application->lux_average);
+        application->sensor_average_until_usec = 0U;
+        if (application->sensor_sample_timer != NULL) {
+            result = sd_event_source_set_enabled(
+                application->sensor_sample_timer,
+                SD_EVENT_OFF
+            );
+            if (result < 0)
+                return result;
+        }
         if (application->configuration.apple_keepalive) {
             result = sabg_apple_als_keepalive_set_enabled(
                 &application->keepalive,
@@ -1490,6 +1523,7 @@ static int handle_suspend_transition(
 
 static int handle_sensor_sample(Application *application, double lux)
 {
+    double averaged_lux;
     uint64_t now_usec;
     bool first_after_resume = false;
     int target;
@@ -1501,6 +1535,7 @@ static int handle_sensor_sample(Application *application, double lux)
     if (!application->model_ready)
         return 0;
 
+    application->raw_lux = lux;
     now_usec = monotonic_usec();
     if (!sabg_suspend_guard_accept_sample(
         &application->suspend_guard,
@@ -1509,22 +1544,50 @@ static int handle_sensor_sample(Application *application, double lux)
     )) {
         return 0;
     }
-    application->current_lux = lux;
     if (first_after_resume) {
         int brightness = application->suspend_guard.protected_brightness;
 
-        sabg_ambient_model_resume(&application->ambient, lux, brightness, now_usec);
+        sabg_lux_average_reset(&application->lux_average, lux, now_usec);
+        application->sensor_average_until_usec = now_usec;
+        averaged_lux = lux;
+        sabg_ambient_model_resume(
+            &application->ambient,
+            averaged_lux,
+            brightness,
+            now_usec
+        );
         result = stop_ambient_motion(application, brightness, now_usec);
         if (result < 0)
             return result;
         if (application->configuration.verbose)
-            fprintf(stderr, "ambient sensor settled at %.2f lux; automation resumed\n", lux);
+            fprintf(
+                stderr,
+                "ambient sensor settled at %.2f lux; automation resumed\n",
+                averaged_lux
+            );
+    } else {
+        averaged_lux = sabg_lux_average_observe(
+            &application->lux_average,
+            lux,
+            now_usec
+        );
     }
+    application->current_lux = averaged_lux;
     if (!application->configuration.legacy_transitions)
-        return update_motion(application, lux, now_usec, true);
-    target = sabg_ambient_model_observe(&application->ambient, lux, now_usec);
+        return update_motion(application, averaged_lux, now_usec, true);
+    target = sabg_ambient_model_observe(
+        &application->ambient,
+        averaged_lux,
+        now_usec
+    );
     if (application->configuration.verbose)
-        fprintf(stderr, "ambient %.2f lux -> target %d%%\n", lux, target);
+        fprintf(
+            stderr,
+            "ambient %.2f raw / %.2f averaged lux -> target %d%%\n",
+            lux,
+            averaged_lux,
+            target
+        );
 
     if (sabg_target_hysteresis_accept(&application->target_hysteresis, target)
         && sabg_smoother_set_target(&application->smoother, target, now_usec)) {
@@ -1551,20 +1614,78 @@ static int handle_sensor_sample(Application *application, double lux)
                 return result;
         }
     }
-    return update_keyboard_target(application, lux, now_usec);
+    return update_keyboard_target(application, averaged_lux, now_usec);
 }
 
 static int on_sensor_properties(sd_bus_message *message, void *userdata, sd_bus_error *error)
 {
     Application *application = userdata;
     double lux = 0.0;
+    bool resume_sample_pending;
+    uint64_t now_usec;
     int result;
 
     (void)error;
     result = read_changed_double(message, SENSOR_INTERFACE, "LightLevel", &lux);
     if (result <= 0)
         return result;
-    return handle_sensor_sample(application, lux);
+    if (lux == application->raw_lux)
+        return 0;
+
+    resume_sample_pending = application->suspend_guard.resume_sample_pending;
+    now_usec = monotonic_usec();
+    application->sensor_average_until_usec = now_usec
+        + sensor_average_window_usec(application);
+    result = handle_sensor_sample(application, lux);
+    if (result < 0 || resume_sample_pending)
+        return result;
+    return schedule_sensor_sample(
+        application,
+        now_usec + SENSOR_SAMPLE_INTERVAL_USEC
+    );
+}
+
+static int on_sensor_sample_timer(sd_event_source *source, uint64_t usec, void *userdata)
+{
+    Application *application = userdata;
+    uint64_t now_usec;
+    int result;
+
+    (void)usec;
+    result = handle_sensor_sample(application, application->raw_lux);
+    if (result < 0)
+        return result;
+    now_usec = monotonic_usec();
+    if (now_usec >= application->sensor_average_until_usec)
+        return 0;
+    result = sd_event_source_set_time(
+        source,
+        now_usec + SENSOR_SAMPLE_INTERVAL_USEC
+    );
+    if (result < 0)
+        return result;
+    return sd_event_source_set_enabled(source, SD_EVENT_ONESHOT);
+}
+
+static int schedule_sensor_sample(Application *application, uint64_t wakeup_usec)
+{
+    int result;
+
+    if (application->sensor_sample_timer == NULL) {
+        return sd_event_add_time(
+            application->event,
+            &application->sensor_sample_timer,
+            CLOCK_MONOTONIC,
+            wakeup_usec,
+            UINT64_C(1000),
+            on_sensor_sample_timer,
+            application
+        );
+    }
+    result = sd_event_source_set_time(application->sensor_sample_timer, wakeup_usec);
+    if (result < 0)
+        return result;
+    return sd_event_source_set_enabled(application->sensor_sample_timer, SD_EVENT_ONESHOT);
 }
 
 static int on_brightness_properties(sd_bus_message *message, void *userdata, sd_bus_error *error)
@@ -1886,6 +2007,8 @@ static int on_sensor_refresh_timer(sd_event_source *source, uint64_t usec, void 
     Application *application = userdata;
     sd_event *event = sd_event_source_get_event(source);
     double lux = 0.0;
+    bool changed;
+    bool resume_sample_pending;
     uint64_t now_usec = usec;
     int result;
 
@@ -1899,7 +2022,18 @@ static int on_sensor_refresh_timer(sd_event_source *source, uint64_t usec, void 
         goto retry;
 
     application->sensor_refresh_attempts = 0;
-    return handle_sensor_sample(application, lux);
+    changed = lux != application->raw_lux;
+    resume_sample_pending = application->suspend_guard.resume_sample_pending;
+    result = handle_sensor_sample(application, lux);
+    if (result < 0 || !changed || resume_sample_pending)
+        return result;
+    now_usec = monotonic_usec();
+    application->sensor_average_until_usec = now_usec
+        + sensor_average_window_usec(application);
+    return schedule_sensor_sample(
+        application,
+        now_usec + SENSOR_SAMPLE_INTERVAL_USEC
+    );
 
 retry:
     application->sensor_refresh_attempts++;
@@ -2136,8 +2270,14 @@ static int application_start(Application *application)
     if (application->configuration.check_only)
         return 1;
 
-    application->current_lux = lux;
     now_usec = monotonic_usec();
+    application->raw_lux = lux;
+    application->current_lux = lux;
+    sabg_lux_average_init(
+        &application->lux_average,
+        sensor_average_window_usec(application)
+    );
+    sabg_lux_average_reset(&application->lux_average, lux, now_usec);
     sabg_display_response_init(&application->display_response);
     if (!application->configuration.calibration_profile_disabled) {
         if (profile_path == NULL)
@@ -2394,6 +2534,9 @@ static void application_destroy(Application *application)
     );
     application->sensor_refresh_timer = sd_event_source_unref(
         application->sensor_refresh_timer
+    );
+    application->sensor_sample_timer = sd_event_source_unref(
+        application->sensor_sample_timer
     );
     application->sensor_properties_slot = sd_bus_slot_unref(application->sensor_properties_slot);
     application->sensor_owner_slot = sd_bus_slot_unref(application->sensor_owner_slot);

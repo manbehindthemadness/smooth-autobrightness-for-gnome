@@ -141,6 +141,8 @@ systemctl --user restart smooth-autobrightness-for-gnome.service
 - Maximum transition duration: 250 ms
 - Adaptive active update rate: 2–60 Hz based on envelope velocity and deadline
 - Target hysteresis: 2 percentage points, with reachable 0%/100% endpoints
+- Ambient sensor input: ten-second time-weighted rolling average updated at 2 Hz
+  only while a changed reading remains inside the window
 - Automatic range: 2–100 percent
 - Display response: brighter environment means a brighter display
 - Keyboard response: darker environment means brighter key illumination
@@ -169,8 +171,10 @@ are persisted only when they change, under the service's private XDG state
 directory, so daemon restarts do not turn an automatic level into the new resume
 baseline.
 
-The transition cap, natural step rates, ambient filter, hysteresis, and
-automatic range are configurable from the command line; see `--help`. Set
+The transition cap, natural step rates, sensor averaging window, ambient
+filter, hysteresis, and automatic range are configurable from the command line;
+see `--help`. Set `--sensor-average-seconds 10` to select a different rolling
+window, or use the default ten seconds. Set
 `--hysteresis 0` to disable output hysteresis. The 2–60 Hz adaptive range is an
 internal safety limit. `--legacy-transitions` temporarily retains the pre-0.4
 restarted-fade controller for compatibility testing.
