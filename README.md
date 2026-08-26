@@ -13,8 +13,10 @@ loop while idle.
 
 ## Status
 
-This project is pre-release. Use `--check` and `--dry-run` before allowing it to
-control a display.
+Version 0.5.0 is the first stable release. It has passed the automated test
+suite and extended daily-use testing on a MacBookPro14,2 running GNOME. New
+hardware should still be introduced with `--check` and `--dry-run` before the
+daemon is allowed to control its display.
 
 ## Runtime interfaces
 

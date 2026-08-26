@@ -1,5 +1,13 @@
 # Development notes
 
+## 2026-08-25 v0.5.0 release
+
+The extended run tests passed, `adaptive-motion` was fast-forwarded into
+`main`, and the first stable release was prepared as v0.5.0. The release keeps
+the ten-second rolling ambient average that eliminated low-light feedback
+oscillation while retaining the event-driven idle behavior and adaptive active
+update rate.
+
 ## 2026-08-23 release-candidate cleanup
 
 Successful startup diagnostics are now limited to `--verbose` and `--check`;
